@@ -35,7 +35,7 @@ TARGETS := \
 	testdata/map_spin_lock \
 	testdata/subprog_reloc \
 	testdata/fwd_decl \
-	internal/btf/testdata/relocs
+	/btf/testdata/relocs
 
 .PHONY: all clean container-all container-shell generate
 
@@ -58,7 +58,7 @@ container-shell:
 
 clean:
 	-$(RM) testdata/*.elf
-	-$(RM) internal/btf/testdata/*.elf
+	-$(RM) /btf/testdata/*.elf
 
 all: $(addsuffix -el.elf,$(TARGETS)) $(addsuffix -eb.elf,$(TARGETS)) generate
 	ln -srf testdata/loader-$(CLANG)-el.elf testdata/loader-el.elf
@@ -89,6 +89,6 @@ testdata/loader-%-eb.elf: testdata/loader.c
 
 # Usage: make VMLINUX=/path/to/vmlinux vmlinux-btf
 .PHONY: vmlinux-btf
-vmlinux-btf: internal/btf/testdata/vmlinux-btf.gz
-internal/btf/testdata/vmlinux-btf.gz: $(VMLINUX)
+vmlinux-btf: /btf/testdata/vmlinux-btf.gz
+/btf/testdata/vmlinux-btf.gz: $(VMLINUX)
 	objcopy --dump-section .BTF=/dev/stdout "$<" /dev/null | gzip > "$@"

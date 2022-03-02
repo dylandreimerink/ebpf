@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 
-	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal"
 )
 
@@ -204,6 +203,12 @@ type FuncInfo struct {
 	fn *Func
 }
 
+func NewFuncInfo(fn *Func) FuncInfo {
+	return FuncInfo{
+		fn: fn,
+	}
+}
+
 type bpfFuncInfo struct {
 	// Instruction offset of the function within an ELF section.
 	InsnOff uint32
@@ -219,7 +224,7 @@ func (fi *FuncInfo) Func() *Func {
 // The offset is converted from bytes to instructions.
 func (fi *FuncInfo) Marshal(w io.Writer, offset uint64) error {
 	bfi := bpfFuncInfo{
-		InsnOff: uint32(offset / asm.InstructionSize),
+		InsnOff: uint32(offset / asmInstructionSize),
 		TypeID:  fi.fn.TypeID,
 	}
 	return binary.Write(w, internal.NativeEndian, &bfi)
@@ -269,13 +274,13 @@ func parseFuncInfoRecords(r io.Reader, bo binary.ByteOrder, recordSize uint32, r
 			return nil, fmt.Errorf("can't read function info: %v", err)
 		}
 
-		if fi.InsnOff%asm.InstructionSize != 0 {
+		if fi.InsnOff%asmInstructionSize != 0 {
 			return nil, fmt.Errorf("offset %v is not aligned with instruction size", fi.InsnOff)
 		}
 
 		// ELF tracks offset in bytes, the kernel expects raw BPF instructions.
 		// Convert as early as possible.
-		fi.InsnOff /= asm.InstructionSize
+		fi.InsnOff /= asmInstructionSize
 
 		out = append(out, fi)
 	}
@@ -325,6 +330,10 @@ func (li *LineInfo) Line() string {
 	return li.line
 }
 
+func (li *LineInfo) SetLine(line string) {
+	li.line = line
+}
+
 func (li *LineInfo) LineNumber() uint32 {
 	return li.lineNumber
 }
@@ -349,7 +358,7 @@ func (li *LineInfo) Marshal(w io.Writer, offset uint64) error {
 	}
 
 	bli := bpfLineInfo{
-		li.insnOff + uint32(offset/asm.InstructionSize),
+		li.insnOff + uint32(offset/asmInstructionSize),
 		li.fileNameOff,
 		li.lineOff,
 		(li.lineNumber << bpfLineShift) | li.lineColumn,
@@ -416,13 +425,13 @@ func parseLineInfoRecords(r io.Reader, bo binary.ByteOrder, recordSize uint32, r
 			return nil, fmt.Errorf("can't read line info: %v", err)
 		}
 
-		if li.InsnOff%asm.InstructionSize != 0 {
+		if li.InsnOff%asmInstructionSize != 0 {
 			return nil, fmt.Errorf("offset %v is not aligned with instruction size", li.InsnOff)
 		}
 
 		// ELF tracks offset in bytes, the kernel expects raw BPF instructions.
 		// Convert as early as possible.
-		li.InsnOff /= asm.InstructionSize
+		li.InsnOff /= asmInstructionSize
 
 		out = append(out, li)
 	}
@@ -492,7 +501,7 @@ func parseCoreReloRecords(r io.Reader, bo binary.ByteOrder, recordSize uint32, r
 			return nil, fmt.Errorf("can't read CO-RE relocation: %v", err)
 		}
 
-		if relo.InsnOff%asm.InstructionSize != 0 {
+		if relo.InsnOff%asmInstructionSize != 0 {
 			return nil, fmt.Errorf("offset %v is not aligned with instruction size", relo.InsnOff)
 		}
 

@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf/asm"
-	"github.com/cilium/ebpf/internal/btf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal/sys"
 )
 
@@ -265,6 +265,80 @@ func (cs *CollectionSpec) LoadAndAssign(to interface{}, opts *CollectionOptions)
 	}
 
 	loader.finalize()
+
+	return nil
+}
+
+// RegenerateBTF (re)generates a *btf.Spec object of every program an map based on the per-instruction metadata.
+//
+// This function guarantees that any types referenced in `insns` are merged with the `original`, this function will
+// completely replace the line and func info of the BTF spec.
+func (cs *CollectionSpec) RegenerateBTF() error {
+	var spec *btf.Spec
+	for _, prog := range cs.Programs {
+		spec = prog.BTF.Spec()
+		break
+	}
+
+	// TODO what about CO-RE relos?
+	spec.LineInfos = make(map[string]btf.LineInfos)
+	spec.FuncInfos = make(map[string]btf.FuncInfo)
+
+	var btfTypes []btf.Type
+
+	for _, prog := range cs.Programs {
+		var funcName string
+		for _, ins := range prog.Instructions {
+			if ins.Symbol() != "" {
+				funcName = ins.Symbol()
+			}
+			if btfFunc := ins.BTFFunc(); btfFunc != nil {
+				funcName = btfFunc.Name
+				spec.FuncInfos[funcName] = btf.NewFuncInfo(btfFunc)
+				btfTypes = append(btfTypes, btfFunc)
+			}
+
+			if ctx := ins.Context(); ctx != nil {
+				lineInfo, ok := ctx.(*btf.LineInfo)
+				if !ok {
+					ctxStr := ctx.String()
+					if ctxStr != "" {
+						lineInfo = &btf.LineInfo{}
+						lineInfo.SetLine(ctx.String())
+					}
+				}
+				if lineInfo != nil {
+					spec.LineInfos[funcName] = append(spec.LineInfos[funcName], *lineInfo)
+				}
+			}
+		}
+	}
+
+	// TODO flatten btfTypes, referenced types should also be added.
+
+	// Add any missing types
+	for _, t := range btfTypes {
+		existing, err := spec.AnyTypesByName(t.TypeName())
+		if err != nil {
+			return fmt.Errorf("any types by name: %w", err)
+		}
+		found := false
+		for _, e := range existing {
+			if e == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			spec.AddType(t)
+		}
+	}
+
+	for name, prog := range cs.Programs {
+		prog.BTF.FuncInfo = spec.FuncInfos[name]
+		prog.BTF.LineInfos = spec.LineInfos[name]
+		break
+	}
 
 	return nil
 }

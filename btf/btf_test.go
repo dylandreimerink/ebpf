@@ -204,7 +204,7 @@ func TestFindVMLinux(t *testing.T) {
 }
 
 func TestLoadSpecFromElf(t *testing.T) {
-	testutils.Files(t, testutils.Glob(t, "../../testdata/loader-e*.elf"), func(t *testing.T, file string) {
+	testutils.Files(t, testutils.Glob(t, "testdata/loader-e*.elf"), func(t *testing.T, file string) {
 		spec := parseELFBTF(t, file)
 
 		if prog, err := spec.Program("xdp_prog"); err != nil || prog == nil {
@@ -285,7 +285,7 @@ func TestGuessBTFByteOrder(t *testing.T) {
 }
 
 func TestSpecCopy(t *testing.T) {
-	spec := parseELFBTF(t, "../../testdata/loader-el.elf")
+	spec := parseELFBTF(t, "../testdata/loader-el.elf")
 
 	if len(spec.types) < 1 {
 		t.Fatal("Not enough types")

@@ -819,7 +819,7 @@ func inflateRawTypes(rawTypes []rawType, rawStrings stringTable) (types []Type, 
 
 		switch raw.Kind() {
 		case kindInt:
-			encoding, offset, bits := intEncoding(*raw.data.(*uint32))
+			encoding, offset, bits := decodeIntEncoding(*raw.data.(*uint32))
 			typ = &Int{id, name, raw.Size(), encoding, offset, bits}
 
 		case kindPointer:
@@ -971,6 +971,207 @@ func inflateRawTypes(rawTypes []rawType, rawStrings stringTable) (types []Type, 
 	}
 
 	return types, namedTypes, nil
+}
+
+// packTypes takes a list of inflated BTF types and packs them into their raw type formats.
+//
+// The type IDs used during packing are the indices of the Types within the given slice. Strings are deduplicated using
+// a stringTableBuilder, which is returned so .BTF.ext strings can be appended to it before making the table definitive.
+func packTypes(types []Type) ([]rawType, *stringTableBuilder, error) {
+	stb := newStringTableBuilder()
+	tid := make(map[Type]TypeID)
+
+	var indexType Type
+
+	for i, t := range types {
+		if _, ok := t.(*Void); ok && i != 0 {
+			continue
+		}
+
+		tid[t] = TypeID(i)
+
+		// "The index_type can be any regular int type (u8, u16, u32, u64, unsigned __int128)"
+		if intType, ok := t.(*Int); indexType == nil && ok {
+			if !intType.Encoding.IsSigned() {
+				indexType = t
+			}
+		}
+	}
+
+	// If we have no existing index type is found, create one.
+	if indexType == nil {
+		indexType = &Int{
+			Name: "__u32",
+			Size: 4,
+		}
+		tid[indexType] = TypeID(len(types))
+		types = append(types, indexType)
+	}
+
+	rawTypes := make([]rawType, 0, len(types))
+
+	convertMembers := func(m []Member) ([]btfMember, bool) {
+		kindFlag := false
+		for _, member := range m {
+			if member.BitfieldSize != 0 {
+				kindFlag = true
+				break
+			}
+		}
+
+		rawMembers := make([]btfMember, len(m))
+		for i, member := range m {
+			rawMembers[i] = btfMember{
+				NameOff: stb.insert(member.Name),
+				Type:    TypeID(tid[member.Type]),
+			}
+
+			if kindFlag {
+				rawMembers[i].Offset = (member.BitfieldSize&0xff)<<24 | (member.OffsetBits & 0xffffff)
+			} else {
+				rawMembers[i].Offset = member.OffsetBits
+			}
+		}
+
+		return rawMembers, kindFlag
+	}
+
+	for _, t := range types {
+		var rt rawType
+
+		switch t := t.(type) {
+		case *Void:
+			continue
+
+		case *Int:
+			rt.SetKind(kindInt)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SizeType = t.Size
+			rt.data = encodeIntEncoding(t.Encoding, t.OffsetBits, t.Bits)
+
+		case *Pointer:
+			rt.SetKind(kindPointer)
+			rt.SizeType = uint32(tid[t.Target])
+
+		case *Array:
+			rt.SetKind(kindArray)
+			rt.data = btfArray{
+				Type:      tid[t.Type],
+				IndexType: tid[indexType],
+				Nelems:    t.Nelems,
+			}
+
+		case *Struct:
+			rt.SetKind(kindStruct)
+			rt.NameOff = stb.insert(t.Name)
+			members, kindFlag := convertMembers(t.Members)
+			rt.SetVlen(len(members))
+			rt.SetKindFlag(kindFlag)
+			rt.SizeType = t.Size
+			rt.data = members
+
+		case *Union:
+			rt.SetKind(kindUnion)
+			rt.NameOff = stb.insert(t.Name)
+			members, kindFlag := convertMembers(t.Members)
+			rt.SetVlen(len(members))
+			rt.SetKindFlag(kindFlag)
+			rt.SizeType = t.Size
+			rt.data = members
+
+		case *Enum:
+			rt.SetKind(kindEnum)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SizeType = 4
+			rt.SetVlen(len(t.Values))
+			values := make([]btfEnum, len(t.Values))
+			for i, val := range t.Values {
+				values[i] = btfEnum{
+					NameOff: stb.insert(val.Name),
+					Val:     val.Value,
+				}
+			}
+			rt.data = values
+
+		case *Fwd:
+			rt.SetKind(kindForward)
+			rt.NameOff = stb.insert(t.Name)
+			if t.Kind == FwdUnion {
+				rt.SetKindFlag(true)
+			}
+
+		case *Typedef:
+			rt.SetKind(kindTypedef)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SetType(tid[t.Type])
+
+		case *Volatile:
+			rt.SetKind(kindVolatile)
+			rt.SetType(tid[t.Type])
+
+		case *Const:
+			rt.SetKind(kindConst)
+			rt.SetType(tid[t.Type])
+
+		case *Restrict:
+			rt.SetKind(kindRestrict)
+			rt.SetType(tid[t.Type])
+
+		case *Func:
+			rt.SetKind(kindFunc)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SetType(tid[t.Type])
+			rt.SetLinkage(t.Linkage)
+
+		case *FuncProto:
+			rt.SetKind(kindFuncProto)
+			rt.SetVlen(len(t.Params))
+			rt.SetType(tid[t.Return])
+			rawParams := make([]btfParam, len(t.Params))
+			for i, param := range t.Params {
+				rawParams[i] = btfParam{
+					NameOff: stb.insert(param.Name),
+					Type:    tid[param.Type],
+				}
+			}
+			rt.data = rawParams
+
+		case *Var:
+			rt.SetKind(kindVar)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SetType(tid[t.Type])
+			rt.data = btfVariable{
+				Linkage: uint32(t.Linkage),
+			}
+
+		case *Datasec:
+			rt.SetKind(kindDatasec)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SetVlen(len(t.Vars))
+			rt.SizeType = t.Size
+			rawVars := make([]btfVarSecinfo, len(t.Vars))
+			for i, v := range t.Vars {
+				rawVars[i] = btfVarSecinfo{
+					Type:   tid[v.Type],
+					Offset: v.Offset,
+					Size:   v.Size,
+				}
+			}
+			rt.data = rawVars
+
+		case *Float:
+			rt.SetKind(kindFloat)
+			rt.NameOff = stb.insert(t.Name)
+			rt.SizeType = t.Size
+
+		default:
+			return nil, nil, fmt.Errorf("unknown btf type %T", t)
+		}
+
+		rawTypes = append(rawTypes, rt)
+	}
+
+	return rawTypes, &stb, nil
 }
 
 // essentialName represents the name of a BTF type stripped of any flavor

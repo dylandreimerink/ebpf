@@ -155,6 +155,14 @@ func (bt *btfType) SetVlen(vlen int) {
 	bt.setInfo(uint32(vlen), btfTypeVlenMask, btfTypeVlenShift)
 }
 
+func (bt *btfType) SetKindFlag(flag bool) {
+	val := uint32(0)
+	if flag {
+		val = 1
+	}
+	bt.setInfo(val, btfTypeKindFlagMask, btfTypeKindFlagShift)
+}
+
 func (bt *btfType) KindFlag() bool {
 	return bt.info(btfTypeKindFlagMask, btfTypeKindFlagShift) == 1
 }
@@ -165,6 +173,10 @@ func (bt *btfType) Linkage() FuncLinkage {
 
 func (bt *btfType) SetLinkage(linkage FuncLinkage) {
 	bt.setInfo(uint32(linkage), btfTypeVlenMask, btfTypeVlenShift)
+}
+
+func (bt *btfType) SetType(id TypeID) {
+	bt.SizeType = uint32(id)
 }
 
 func (bt *btfType) Type() TypeID {
@@ -282,6 +294,10 @@ func readTypes(r io.Reader, bo binary.ByteOrder) ([]rawType, error) {
 	}
 }
 
-func intEncoding(raw uint32) (IntEncoding, uint32, byte) {
+func decodeIntEncoding(raw uint32) (IntEncoding, uint32, byte) {
 	return IntEncoding((raw & 0x0f000000) >> 24), (raw & 0x00ff0000) >> 16, byte(raw & 0x000000ff)
+}
+
+func encodeIntEncoding(enc IntEncoding, offset uint32, bits byte) uint32 {
+	return (uint32(enc) & 0x0f << 24) | (offset & 0xff << 16) | uint32(bits)
 }

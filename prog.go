@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
-	"github.com/cilium/ebpf/internal/btf"
 	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/unix"
 )
@@ -325,7 +325,7 @@ func newProgramWithOptions(spec *ProgramSpec, opts ProgramOptions, handles *hand
 		}
 	}
 
-	insns, err := core.Apply(spec.Instructions)
+	insns, err := spec.Instructions.ApplyCOREFixups(core)
 	if err != nil {
 		return nil, fmt.Errorf("CO-RE fixup: %w", err)
 	}

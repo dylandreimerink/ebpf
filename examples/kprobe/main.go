@@ -11,6 +11,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
@@ -32,7 +33,9 @@ func main() {
 
 	// Load pre-compiled programs and maps into the kernel.
 	objs := bpfObjects{}
-	if err := loadBpfObjects(&objs, nil); err != nil {
+	if err := loadBpfObjects(&objs, &ebpf.CollectionOptions{Programs: ebpf.ProgramOptions{
+		LogLevel: 2,
+	}}); err != nil {
 		log.Fatalf("loading objects: %v", err)
 	}
 	defer objs.Close()

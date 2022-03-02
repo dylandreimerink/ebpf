@@ -10,6 +10,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal/unix"
 )
 
@@ -353,6 +354,63 @@ ref:
 	}
 }
 
+func (ins *Instruction) applyCOREFixup(f btf.COREFixup) error {
+	if f.Poison {
+		return errors.New("can't poison individual instruction")
+	}
+
+	switch class := ins.OpCode.Class(); class {
+	case LdXClass, StClass, StXClass:
+		if want := int16(f.Local); want != ins.Offset {
+			return fmt.Errorf("invalid offset %d, expected %d", ins.Offset, want)
+		}
+
+		if f.Target > math.MaxInt16 {
+			return fmt.Errorf("offset %d exceeds MaxInt16", f.Target)
+		}
+
+		ins.Offset = int16(f.Target)
+
+	case LdClass:
+		if !ins.IsConstantLoad(DWord) {
+			return fmt.Errorf("not a dword-sized immediate load")
+		}
+
+		if want := int64(f.Local); want != ins.Constant {
+			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
+		}
+
+		ins.Constant = int64(f.Target)
+
+	case ALUClass:
+		if ins.OpCode.ALUOp() == Swap {
+			return fmt.Errorf("relocation against swap")
+		}
+
+		fallthrough
+
+	case ALU64Class:
+		if src := ins.OpCode.Source(); src != ImmSource {
+			return fmt.Errorf("invalid source %s", src)
+		}
+
+		if want := int64(f.Local); want != ins.Constant {
+			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
+		}
+
+		if f.Target > math.MaxInt32 {
+			return fmt.Errorf("immediate %d exceeds MaxInt32", f.Target)
+		}
+
+		ins.Constant = int64(f.Target)
+
+	default:
+		return fmt.Errorf("invalid class %s", class)
+	}
+
+	return nil
+}
+
 func (ins Instruction) equal(other Instruction) bool {
 	return ins.OpCode == other.OpCode &&
 		ins.Dst == other.Dst &&
@@ -408,6 +466,27 @@ func (ins Instruction) Context() fmt.Stringer {
 	return ins.metadata.context
 }
 
+// WithBTFFunc
+func (ins Instruction) WithBTFFunc(f *btf.Func) Instruction {
+	if (ins.metadata != nil && ins.metadata.btfFunc == f) ||
+		(ins.metadata == nil && f == nil) {
+		return ins
+	}
+
+	ins.metadata = ins.metadata.copy()
+	ins.metadata.btfFunc = f
+	return ins
+}
+
+// BTFFunc
+func (ins Instruction) BTFFunc() *btf.Func {
+	if ins.metadata == nil {
+		return nil
+	}
+
+	return ins.metadata.btfFunc
+}
+
 // setMap sets the *ebpf.Map from which this instruction preforms a data.
 func (ins *Instruction) setMap(m FDer) {
 	if (ins.metadata != nil && ins.metadata.bpfMap == m) ||
@@ -436,6 +515,8 @@ type metadata struct {
 
 	// bpfMap denotes the *ebpf.Map from which this instruction preforms a data.
 	bpfMap FDer
+
+	btfFunc *btf.Func
 }
 
 // copy returns a copy of metadata.
@@ -621,6 +702,47 @@ func (insns Instructions) ReferenceOffsets() map[string][]int {
 	}
 
 	return offsets
+}
+
+// Apply returns a copy of insns with CO-RE relocations applied.
+func (insns Instructions) ApplyCOREFixups(fs btf.COREFixups) (Instructions, error) {
+	if len(fs) == 0 {
+		cpy := make(Instructions, len(insns))
+		copy(cpy, insns)
+		return insns, nil
+	}
+
+	cpy := make(Instructions, 0, len(insns))
+	iter := insns.Iterate()
+	for iter.Next() {
+		fixup, ok := fs[iter.Offset.Bytes()]
+		if !ok {
+			cpy = append(cpy, *iter.Ins)
+			continue
+		}
+
+		ins := *iter.Ins
+		if fixup.Poison {
+			const badRelo = BuiltinFunc(0xbad2310)
+
+			cpy = append(cpy, badRelo.Call())
+			if ins.OpCode.IsDWordLoad() {
+				// 64 bit constant loads occupy two raw bpf instructions, so
+				// we need to add another instruction as padding.
+				cpy = append(cpy, badRelo.Call())
+			}
+
+			continue
+		}
+
+		if err := ins.applyCOREFixup(fixup); err != nil {
+			return nil, fmt.Errorf("instruction %d, offset %d: %s: %w", iter.Index, iter.Offset.Bytes(), fixup.Kind, err)
+		}
+
+		cpy = append(cpy, ins)
+	}
+
+	return cpy, nil
 }
 
 // Format implements fmt.Formatter.

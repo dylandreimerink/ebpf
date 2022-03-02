@@ -18,6 +18,9 @@ import (
 	"github.com/cilium/ebpf/internal/unix"
 )
 
+// asmInstructionSize is the size of a BPF instruction in bytes
+const asmInstructionSize = 8
+
 const btfMagic = 0xeB9F
 
 // Errors returned by BTF functions.
@@ -33,8 +36,8 @@ type ID uint32
 // Spec represents decoded BTF.
 type Spec struct {
 	// Data from .BTF.
-	rawTypes []rawType
-	strings  stringTable
+	// rawTypes []rawType
+	strings stringTable
 
 	// Inflated Types.
 	types []Type
@@ -44,11 +47,24 @@ type Spec struct {
 	namedTypes map[essentialName][]Type
 
 	// Data from .BTF.ext. indexed by function name.
-	funcInfos map[string]FuncInfo
-	lineInfos map[string]LineInfos
-	coreRelos map[string]CoreRelos
+	FuncInfos map[string]FuncInfo
+	LineInfos map[string]LineInfos
+	CoreRelos map[string]CoreRelos
 
 	byteOrder binary.ByteOrder
+}
+
+func (s *Spec) AddType(typ Type) {
+	s.types = append(s.types, typ)
+
+	if name := newEssentialName(typ.TypeName()); name != "" {
+		s.namedTypes[name] = append(s.namedTypes[name], typ)
+	}
+}
+
+func (s *Spec) RemoveType(typ Type) {
+	// TODO implement. How to go about this? If we delete from `types` the IDs of all types after will change.
+	// we could just make the type Void and ignore it when converting `types` to `rawTypes` and `strings`
 }
 
 type btfHeader struct {
@@ -193,17 +209,26 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 // GetFuncLineInfos returns a map of LineInfo's for the given function name. The map is indexes by the
 // instruction offset of the lineInfo.
 func (spec *Spec) GetFuncLineInfos(funcName string) map[uint32]LineInfo {
-	if spec.lineInfos == nil {
+	if spec.LineInfos == nil {
 		return make(map[uint32]LineInfo)
 	}
 
-	infos := spec.lineInfos[funcName]
+	infos := spec.LineInfos[funcName]
 	m := make(map[uint32]LineInfo, len(infos))
 	for _, lineInfo := range infos {
 		m[lineInfo.insnOff] = lineInfo
 	}
 
 	return m
+}
+
+// GetFunc
+func (spec *Spec) GetFunc(funcName string) *Func {
+	if spec.FuncInfos == nil {
+		return nil
+	}
+
+	return spec.FuncInfos[funcName].fn
 }
 
 // splitExtInfos takes FuncInfos, LineInfos and CoreRelos indexed by section and
@@ -307,9 +332,9 @@ func (spec *Spec) splitExtInfos(info *extInfo) error {
 		}
 	}
 
-	spec.funcInfos = ofi
-	spec.lineInfos = oli
-	spec.coreRelos = ocr
+	spec.FuncInfos = ofi
+	spec.LineInfos = oli
+	spec.CoreRelos = ocr
 
 	return nil
 }
@@ -331,7 +356,7 @@ func loadRawSpec(btf io.Reader, bo binary.ByteOrder, sectionSizes map[string]uin
 	}
 
 	return &Spec{
-		rawTypes:   rawTypes,
+		// rawTypes:   rawTypes,
 		namedTypes: typesByName,
 		types:      types,
 		strings:    rawStrings,
@@ -553,13 +578,13 @@ func (s *Spec) Copy() *Spec {
 
 	// NB: Other parts of spec are not copied since they are immutable.
 	return &Spec{
-		s.rawTypes,
+		// s.rawTypes,
 		s.strings,
 		types,
 		namedTypes,
-		s.funcInfos,
-		s.lineInfos,
-		s.coreRelos,
+		s.FuncInfos,
+		s.LineInfos,
+		s.CoreRelos,
 		s.byteOrder,
 	}
 }
@@ -580,8 +605,30 @@ func (s *Spec) marshal(opts marshalOpts) ([]byte, error) {
 	// we don't know the size of the type section yet.
 	_, _ = buf.Write(make([]byte, headerLen))
 
+	// TODO perhaps this should happen explicitly, since updating the stringTable is a side effect.
+	rawTypes, stb, err := packTypes(s.types)
+	if err != nil {
+		return nil, fmt.Errorf("pack types: %w", err)
+	}
+
+	funcs := make([]string, 0, len(s.LineInfos))
+	for name := range s.LineInfos {
+		funcs = append(funcs, name)
+	}
+	sort.Strings(funcs)
+
+	// Add all lines to the new string table, and update the offsets to offsets in the new string table.
+	for _, funcName := range funcs {
+		for i, line := range s.LineInfos[funcName] {
+			s.LineInfos[funcName][i].fileNameOff = stb.insert(line.fileName)
+			s.LineInfos[funcName][i].lineOff = stb.insert(line.line)
+		}
+	}
+	// Replace the existing table with the new table
+	s.strings = stb.stringTable()
+
 	// Write type section, just after the header.
-	for _, raw := range s.rawTypes {
+	for _, raw := range rawTypes {
 		switch {
 		case opts.StripFuncLinkage && raw.Kind() == kindFunc:
 			raw.SetLinkage(StaticFunc)
@@ -610,7 +657,7 @@ func (s *Spec) marshal(opts marshalOpts) ([]byte, error) {
 	}
 
 	raw := buf.Bytes()
-	err := binary.Write(sliceWriter(raw[:headerLen]), opts.ByteOrder, header)
+	err = binary.Write(sliceWriter(raw[:headerLen]), opts.ByteOrder, header)
 	if err != nil {
 		return nil, fmt.Errorf("can't write header: %v", err)
 	}
@@ -633,13 +680,13 @@ func (sw sliceWriter) Write(p []byte) (int, error) {
 // Returns an error which may wrap ErrNoExtendedInfo if the Spec doesn't
 // contain extended BTF info.
 func (s *Spec) Program(name string) (*Program, error) {
-	if s.funcInfos == nil && s.lineInfos == nil && s.coreRelos == nil {
+	if s.FuncInfos == nil && s.LineInfos == nil && s.CoreRelos == nil {
 		return nil, fmt.Errorf("BTF for function %s: %w", name, ErrNoExtendedInfo)
 	}
 
-	funcInfo, funcOK := s.funcInfos[name]
-	lineInfos, lineOK := s.lineInfos[name]
-	relos, coreOK := s.coreRelos[name]
+	funcInfo, funcOK := s.FuncInfos[name]
+	lineInfos, lineOK := s.LineInfos[name]
+	relos, coreOK := s.CoreRelos[name]
 
 	if !funcOK && !lineOK && !coreOK {
 		return nil, fmt.Errorf("no extended BTF info for function %s", name)

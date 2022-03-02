@@ -13,8 +13,8 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
-	"github.com/cilium/ebpf/internal/btf"
 	"github.com/cilium/ebpf/internal/unix"
 )
 
@@ -358,6 +358,10 @@ func (ec *elfCode) loadFunctions(section *elfSection) (map[string]asm.Instructio
 	for {
 		// Symbols denote the first instruction of a function body.
 		ins := asm.Instruction{}.WithSymbol(section.symbols[secOffset].Name)
+
+		if ec.btf != nil {
+			ins = ins.WithBTFFunc(ec.btf.GetFunc(ins.Symbol()))
+		}
 
 		// Pull one instruction from the instruction stream.
 		n, err := ins.Unmarshal(r, ec.ByteOrder)

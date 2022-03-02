@@ -6,6 +6,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/testutils"
+	"github.com/davecgh/go-spew/spew"
 )
 
 func TestFreplace(t *testing.T) {
@@ -21,12 +22,27 @@ func TestFreplace(t *testing.T) {
 			return
 		}
 
+		spew.Config.DisableMethods = true
+		// spew.Dump(spec.Programs["sched_process_exec"].BTF.LineInfos)
+		// spew.Dump(spec.Programs["replacement"].BTF.LineInfos)
+		// // err = spec.RegenerateBTF()
+		// spew.Dump(spec.Programs["sched_process_exec"].BTF.LineInfos)
+		// spew.Dump(spec.Programs["replacement"].BTF.LineInfos)
+		if err != nil {
+			t.Fatal("Can't regenerate BTF: %w", err)
+		}
+
 		target, err := ebpf.NewProgram(spec.Programs["sched_process_exec"])
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatal("Can't create target program:", err)
 		}
 		defer target.Close()
+
+		// time.Sleep(15 * time.Second)
+
+		// spew.Dump(spec.Programs["sched_process_exec"].BTF.LineInfos)
+		// spew.Dump(spec.Programs["replacement"].BTF.LineInfos)
 
 		// Test attachment specified at load time
 		spec.Programs["replacement"].AttachTarget = target

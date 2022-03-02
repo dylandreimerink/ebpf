@@ -52,3 +52,39 @@ func (st stringTable) Lookup(offset uint32) (string, error) {
 
 	return string(str[:end]), nil
 }
+
+type stringTableBuilder struct {
+	offsets map[string]uint32
+	buf     bytes.Buffer
+}
+
+func newStringTableBuilder() stringTableBuilder {
+	stb := stringTableBuilder{
+		offsets: map[string]uint32{
+			"":   0,
+			"\n": 0,
+		},
+	}
+	stb.buf.WriteByte(0)
+	return stb
+}
+
+func (stb *stringTableBuilder) insert(str string) uint32 {
+	off, found := stb.offsets[str]
+	if found {
+		return off
+	}
+
+	strBytes := make([]byte, len(str)+1)
+	copy(strBytes, str)
+
+	off = uint32(stb.buf.Len())
+	stb.offsets[str] = off
+	stb.buf.Write(strBytes)
+
+	return off
+}
+
+func (stb *stringTableBuilder) stringTable() stringTable {
+	return stringTable(stb.buf.Bytes())
+}
