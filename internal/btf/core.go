@@ -3,13 +3,10 @@ package btf
 import (
 	"errors"
 	"fmt"
-	"math"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/cilium/ebpf/asm"
 )
 
 // Code in this file is derived from libbpf, which is available under a BSD
@@ -34,109 +31,11 @@ func (f COREFixup) String() string {
 	return fmt.Sprintf("%s=%d->%d", f.Kind, f.Local, f.Target)
 }
 
-func (f COREFixup) apply(ins *asm.Instruction) error {
-	if f.Poison {
-		return errors.New("can't poison individual instruction")
-	}
-
-	switch class := ins.OpCode.Class(); class {
-	case asm.LdXClass, asm.StClass, asm.StXClass:
-		if want := int16(f.Local); want != ins.Offset {
-			return fmt.Errorf("invalid offset %d, expected %d", ins.Offset, want)
-		}
-
-		if f.Target > math.MaxInt16 {
-			return fmt.Errorf("offset %d exceeds MaxInt16", f.Target)
-		}
-
-		ins.Offset = int16(f.Target)
-
-	case asm.LdClass:
-		if !ins.IsConstantLoad(asm.DWord) {
-			return fmt.Errorf("not a dword-sized immediate load")
-		}
-
-		if want := int64(f.Local); want != ins.Constant {
-			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
-		}
-
-		ins.Constant = int64(f.Target)
-
-	case asm.ALUClass:
-		if ins.OpCode.ALUOp() == asm.Swap {
-			return fmt.Errorf("relocation against swap")
-		}
-
-		fallthrough
-
-	case asm.ALU64Class:
-		if src := ins.OpCode.Source(); src != asm.ImmSource {
-			return fmt.Errorf("invalid source %s", src)
-		}
-
-		if want := int64(f.Local); want != ins.Constant {
-			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
-		}
-
-		if f.Target > math.MaxInt32 {
-			return fmt.Errorf("immediate %d exceeds MaxInt32", f.Target)
-		}
-
-		ins.Constant = int64(f.Target)
-
-	default:
-		return fmt.Errorf("invalid class %s", class)
-	}
-
-	return nil
-}
-
 func (f COREFixup) isNonExistant() bool {
 	return f.Kind.checksForExistence() && f.Target == 0
 }
 
 type COREFixups map[uint64]COREFixup
-
-// Apply returns a copy of insns with CO-RE relocations applied.
-func (fs COREFixups) Apply(insns asm.Instructions) (asm.Instructions, error) {
-	if len(fs) == 0 {
-		cpy := make(asm.Instructions, len(insns))
-		copy(cpy, insns)
-		return insns, nil
-	}
-
-	cpy := make(asm.Instructions, 0, len(insns))
-	iter := insns.Iterate()
-	for iter.Next() {
-		fixup, ok := fs[iter.Offset.Bytes()]
-		if !ok {
-			cpy = append(cpy, *iter.Ins)
-			continue
-		}
-
-		ins := *iter.Ins
-		if fixup.Poison {
-			const badRelo = asm.BuiltinFunc(0xbad2310)
-
-			cpy = append(cpy, badRelo.Call())
-			if ins.OpCode.IsDWordLoad() {
-				// 64 bit constant loads occupy two raw bpf instructions, so
-				// we need to add another instruction as padding.
-				cpy = append(cpy, badRelo.Call())
-			}
-
-			continue
-		}
-
-		if err := fixup.apply(&ins); err != nil {
-			return nil, fmt.Errorf("instruction %d, offset %d: %s: %w", iter.Index, iter.Offset.Bytes(), fixup.Kind, err)
-		}
-
-		cpy = append(cpy, ins)
-	}
-
-	return cpy, nil
-}
 
 // COREKind is the type of CO-RE relocation
 type COREKind uint32

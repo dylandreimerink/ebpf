@@ -325,7 +325,7 @@ func newProgramWithOptions(spec *ProgramSpec, opts ProgramOptions, handles *hand
 		}
 	}
 
-	insns, err := core.Apply(spec.Instructions)
+	insns, err := spec.Instructions.ApplyCOREFixups(core)
 	if err != nil {
 		return nil, fmt.Errorf("CO-RE fixup: %w", err)
 	}

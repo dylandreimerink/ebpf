@@ -10,6 +10,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/cilium/ebpf/internal/btf"
 	"github.com/cilium/ebpf/internal/unix"
 )
 
@@ -348,6 +349,21 @@ func (ins Instruction) Reference() string {
 	return ins.metadata.Reference()
 }
 
+// WithBTFFunc marks this instruction as the first instruction of the function `f`
+func (ins Instruction) WithBTFFunc(f *btf.Func) Instruction {
+	if ins.BTFFunc() == f {
+		return ins
+	}
+
+	ins.copyMetadata().btfFunc = f
+	return ins
+}
+
+// BTFFunc returns the BTF type of a function, if not nil, this is the first instruction of the returned function.
+func (ins Instruction) BTFFunc() *btf.Func {
+	return ins.metadata.BTFFunc()
+}
+
 // copyMetadata is a convenience method for copying ins.metadata, assigning
 // the new copy to its metadata field and returning a pointer to the copy
 // so one access can be chained.
@@ -362,6 +378,9 @@ type metadata struct {
 	reference string
 	// symbol denotes an instruction at the start of a function body.
 	symbol string
+
+	// btfFunc denotes the BTF type of the function and indicates this instruction is the first of that function.
+	btfFunc *btf.Func
 }
 
 // Reference is a safe accessor to metadata's reference field.
@@ -380,6 +399,72 @@ func (m *metadata) Symbol() string {
 		return ""
 	}
 	return m.symbol
+}
+
+// BTFFunc is a safe accessor to metadata's btfFunc field.
+// It can be called on a nil m, in which case it will return the default value.
+func (m *metadata) BTFFunc() *btf.Func {
+	if m == nil {
+		return nil
+	}
+	return m.btfFunc
+}
+
+func (ins *Instruction) applyCOREFixup(f btf.COREFixup) error {
+	if f.Poison {
+		return errors.New("can't poison individual instruction")
+	}
+
+	switch class := ins.OpCode.Class(); class {
+	case LdXClass, StClass, StXClass:
+		if want := int16(f.Local); want != ins.Offset {
+			return fmt.Errorf("invalid offset %d, expected %d", ins.Offset, want)
+		}
+
+		if f.Target > math.MaxInt16 {
+			return fmt.Errorf("offset %d exceeds MaxInt16", f.Target)
+		}
+
+		ins.Offset = int16(f.Target)
+
+	case LdClass:
+		if !ins.IsConstantLoad(DWord) {
+			return fmt.Errorf("not a dword-sized immediate load")
+		}
+
+		if want := int64(f.Local); want != ins.Constant {
+			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
+		}
+
+		ins.Constant = int64(f.Target)
+
+	case ALUClass:
+		if ins.OpCode.ALUOp() == Swap {
+			return fmt.Errorf("relocation against swap")
+		}
+
+		fallthrough
+
+	case ALU64Class:
+		if src := ins.OpCode.Source(); src != ImmSource {
+			return fmt.Errorf("invalid source %s", src)
+		}
+
+		if want := int64(f.Local); want != ins.Constant {
+			return fmt.Errorf("invalid immediate %d, expected %d", ins.Constant, want)
+		}
+
+		if f.Target > math.MaxInt32 {
+			return fmt.Errorf("immediate %d exceeds MaxInt32", f.Target)
+		}
+
+		ins.Constant = int64(f.Target)
+
+	default:
+		return fmt.Errorf("invalid class %s", class)
+	}
+
+	return nil
 }
 
 // copy returns a copy of metadata.
@@ -529,6 +614,47 @@ func (insns Instructions) ReferenceOffsets() map[string][]int {
 	}
 
 	return offsets
+}
+
+// Apply returns a copy of insns with CO-RE relocations applied.
+func (insns Instructions) ApplyCOREFixups(fs btf.COREFixups) (Instructions, error) {
+	if len(fs) == 0 {
+		cpy := make(Instructions, len(insns))
+		copy(cpy, insns)
+		return insns, nil
+	}
+
+	cpy := make(Instructions, 0, len(insns))
+	iter := insns.Iterate()
+	for iter.Next() {
+		fixup, ok := fs[iter.Offset.Bytes()]
+		if !ok {
+			cpy = append(cpy, *iter.Ins)
+			continue
+		}
+
+		ins := *iter.Ins
+		if fixup.Poison {
+			const badRelo = BuiltinFunc(0xbad2310)
+
+			cpy = append(cpy, badRelo.Call())
+			if ins.OpCode.IsDWordLoad() {
+				// 64 bit constant loads occupy two raw bpf instructions, so
+				// we need to add another instruction as padding.
+				cpy = append(cpy, badRelo.Call())
+			}
+
+			continue
+		}
+
+		if err := ins.applyCOREFixup(fixup); err != nil {
+			return nil, fmt.Errorf("instruction %d, offset %d: %s: %w", iter.Index, iter.Offset.Bytes(), fixup.Kind, err)
+		}
+
+		cpy = append(cpy, ins)
+	}
+
+	return cpy, nil
 }
 
 // Format implements fmt.Formatter.

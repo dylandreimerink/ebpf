@@ -18,6 +18,9 @@ import (
 	"github.com/cilium/ebpf/internal/unix"
 )
 
+// asmInstructionSize is the size of a BPF instruction in bytes
+const asmInstructionSize = 8
+
 const btfMagic = 0xeB9F
 
 // Errors returned by BTF functions.
