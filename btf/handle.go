@@ -100,7 +100,7 @@ func NewHandleFromID(id ID) (*Handle, error) {
 //
 // base must contain type information for vmlinux if the handle is for
 // a kernel module. It may be nil otherwise.
-func (h *Handle) Spec(base *Spec) (*Spec, error) {
+func (h *Handle) Spec(base Spec) (Spec, error) {
 	var btfInfo sys.BtfInfo
 	btfBuffer := make([]byte, h.size)
 	btfInfo.Btf, btfInfo.BtfSize = sys.NewSlicePointerLen(btfBuffer)

@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"reflect"
@@ -53,6 +54,23 @@ func TestCollectionSpecNotModified(t *testing.T) {
 }
 
 func TestCollectionSpecCopy(t *testing.T) {
+	types := []btf.Type{(*btf.Void)(nil), &btf.Int{Size: 4}, &btf.Int{Size: 2}}
+
+	b, err := btf.NewBuilder(types[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := b.Marshal(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := btf.LoadSpecFromReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	cs := &CollectionSpec{
 		Maps: map[string]*MapSpec{
 			"my-map": {
@@ -73,7 +91,7 @@ func TestCollectionSpecCopy(t *testing.T) {
 				License: "MIT",
 			},
 		},
-		Types: &btf.Spec{},
+		Types: spec,
 	}
 	cpy := cs.Copy()
 

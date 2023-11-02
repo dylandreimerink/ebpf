@@ -106,7 +106,7 @@ func hasFunctionReferences(insns asm.Instructions) bool {
 //
 // Passing a nil target will relocate against the running kernel. insns are
 // modified in place.
-func applyRelocations(insns asm.Instructions, target *btf.Spec, bo binary.ByteOrder) error {
+func applyRelocations(insns asm.Instructions, target btf.Spec, bo binary.ByteOrder) error {
 	var relos []*btf.CORERelocation
 	var reloInsns []*asm.Instruction
 	iter := insns.Iterate()

@@ -40,7 +40,7 @@ type CollectionSpec struct {
 
 	// Types holds type information about Maps and Programs.
 	// Modifications to Types are currently undefined behaviour.
-	Types *btf.Spec
+	Types btf.Spec
 
 	// ByteOrder specifies whether the ELF was compiled for
 	// big-endian or little-endian architectures.

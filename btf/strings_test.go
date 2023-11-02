@@ -97,7 +97,7 @@ func TestStringTableBuilder(t *testing.T) {
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("Can't parse string table"))
 }
 
-func newStringTable(strings ...string) *stringTable {
+func newStringTable(strings ...string) *eagerStringTable {
 	offsets := make([]uint32, len(strings))
 
 	var offset uint32
@@ -106,5 +106,5 @@ func newStringTable(strings ...string) *stringTable {
 		offset += uint32(len(str)) + 1 // account for NUL
 	}
 
-	return &stringTable{nil, offsets, strings}
+	return &eagerStringTable{nil, offsets, strings}
 }

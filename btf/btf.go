@@ -31,7 +31,7 @@ type ID = sys.BTFID
 
 // Spec allows querying a set of Types and loading the set into the
 // kernel.
-type Spec struct {
+type eagerSpec struct {
 	// All types contained by the spec, not including types from the base in
 	// case the spec was parsed from split BTF.
 	types []Type
@@ -47,19 +47,21 @@ type Spec struct {
 	namedTypes map[essentialName][]Type
 
 	// String table from ELF.
-	strings *stringTable
+	strings stringTable
 
 	// Byte order of the ELF we decoded the spec from, may be nil.
 	byteOrder binary.ByteOrder
 }
 
 // LoadSpec opens file and calls LoadSpecFromReader on it.
-func LoadSpec(file string) (*Spec, error) {
+func LoadSpec(file string) (Spec, error) {
 	fh, err := os.Open(file)
 	if err != nil {
 		return nil, err
 	}
-	defer fh.Close()
+	// TODO when we are parsing as a lazy spec we need to keep the file open
+	//      Perhaps we should only use lazy spec for vmlinux?
+	// defer fh.Close()
 
 	return LoadSpecFromReader(fh)
 }
@@ -68,7 +70,7 @@ func LoadSpec(file string) (*Spec, error) {
 //
 // Returns ErrNotFound if reading from an ELF which contains no BTF. ExtInfos
 // may be nil.
-func LoadSpecFromReader(rd io.ReaderAt) (*Spec, error) {
+func LoadSpecFromReader(rd io.ReaderAt) (Spec, error) {
 	file, err := internal.NewSafeELFFile(rd)
 	if err != nil {
 		if bo := guessRawBTFByteOrder(rd); bo != nil {
@@ -85,7 +87,7 @@ func LoadSpecFromReader(rd io.ReaderAt) (*Spec, error) {
 //
 // ExtInfos may be nil if the ELF doesn't contain section metadata.
 // Returns ErrNotFound if the ELF contains no BTF.
-func LoadSpecAndExtInfosFromReader(rd io.ReaderAt) (*Spec, *ExtInfos, error) {
+func LoadSpecAndExtInfosFromReader(rd io.ReaderAt) (Spec, *ExtInfos, error) {
 	file, err := internal.NewSafeELFFile(rd)
 	if err != nil {
 		return nil, nil, err
@@ -102,6 +104,18 @@ func LoadSpecAndExtInfosFromReader(rd io.ReaderAt) (*Spec, *ExtInfos, error) {
 	}
 
 	return spec, extInfos, nil
+}
+
+func (ls *eagerSpec) stringTable() stringTable {
+	return ls.strings
+}
+
+func (ls *eagerSpec) getFirstTypeID() TypeID {
+	return ls.firstTypeID
+}
+
+func (ls *eagerSpec) getByteOrder() binary.ByteOrder {
+	return ls.byteOrder
 }
 
 // symbolOffsets extracts all symbols offsets from an ELF and indexes them by
@@ -140,7 +154,7 @@ func symbolOffsets(file *internal.SafeELFFile) (map[symbol]uint32, error) {
 	return offsets, nil
 }
 
-func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
+func loadSpecFromELF(file *internal.SafeELFFile) (Spec, error) {
 	var (
 		btfSection   *elf.Section
 		sectionSizes = make(map[string]uint32)
@@ -181,7 +195,12 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 		return nil, err
 	}
 
-	err = fixupDatasec(spec.types, sectionSizes, offsets)
+	types, err := spec.anyTypesByKind(kindDatasec)
+	if err != nil {
+		return nil, err
+	}
+
+	err = fixupDatasec(types, sectionSizes, offsets)
 	if err != nil {
 		return nil, err
 	}
@@ -189,19 +208,29 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 	return spec, nil
 }
 
-func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, base *Spec) (*Spec, error) {
+var lazySpecMode = true
+
+func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, base Spec) (Spec, error) {
+	if lazySpecMode {
+		return lazyLoadRawSpec(btf, bo, base)
+	}
+
+	return loadRawEagerSpec(btf, bo, base)
+}
+
+func loadRawEagerSpec(btf io.ReaderAt, bo binary.ByteOrder, base Spec) (Spec, error) {
 	var (
-		baseStrings *stringTable
+		baseStrings stringTable
 		firstTypeID TypeID
 		err         error
 	)
 
 	if base != nil {
-		if base.firstTypeID != 0 {
+		if base.getFirstTypeID() != 0 {
 			return nil, fmt.Errorf("can't use split BTF as base")
 		}
 
-		baseStrings = base.strings
+		baseStrings = base.stringTable()
 
 		firstTypeID, err = base.nextTypeID()
 		if err != nil {
@@ -221,7 +250,7 @@ func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, base *Spec) (*Spec, error
 
 	typeIDs, typesByName := indexTypes(types, firstTypeID)
 
-	return &Spec{
+	return &eagerSpec{
 		namedTypes:  typesByName,
 		typeIDs:     typeIDs,
 		types:       types,
@@ -259,7 +288,7 @@ func indexTypes(types []Type, firstTypeID TypeID) (map[Type]TypeID, map[essentia
 //
 // Defaults to /sys/kernel/btf/vmlinux and falls back to scanning the file system
 // for vmlinux ELFs. Returns an error wrapping ErrNotSupported if BTF is not enabled.
-func LoadKernelSpec() (*Spec, error) {
+func LoadKernelSpec() (Spec, error) {
 	spec, _, err := kernelSpec()
 	if err != nil {
 		return nil, err
@@ -269,7 +298,7 @@ func LoadKernelSpec() (*Spec, error) {
 
 var kernelBTF struct {
 	sync.RWMutex
-	spec *Spec
+	spec Spec
 	// True if the spec was read from an ELF instead of raw BTF in /sys.
 	fallback bool
 }
@@ -282,7 +311,7 @@ func FlushKernelSpec() {
 	kernelBTF.spec, kernelBTF.fallback = nil, false
 }
 
-func kernelSpec() (*Spec, bool, error) {
+func kernelSpec() (Spec, bool, error) {
 	kernelBTF.RLock()
 	spec, fallback := kernelBTF.spec, kernelBTF.fallback
 	kernelBTF.RUnlock()
@@ -307,10 +336,11 @@ func kernelSpec() (*Spec, bool, error) {
 	return spec, fallback, nil
 }
 
-func loadKernelSpec() (_ *Spec, fallback bool, _ error) {
+func loadKernelSpec() (_ Spec, fallback bool, _ error) {
 	fh, err := os.Open("/sys/kernel/btf/vmlinux")
 	if err == nil {
-		defer fh.Close()
+		// TODO: can't close when using lazy spec
+		// defer fh.Close()
 
 		spec, err := loadRawSpec(fh, internal.NativeEndian, nil)
 		return spec, false, err
@@ -320,7 +350,8 @@ func loadKernelSpec() (_ *Spec, fallback bool, _ error) {
 	if err != nil {
 		return nil, false, err
 	}
-	defer file.Close()
+	// TODO: can't close when using lazy spec
+	// defer fh.Close()
 
 	spec, err := loadSpecFromELF(file)
 	return spec, true, err
@@ -373,7 +404,7 @@ func guessRawBTFByteOrder(r io.ReaderAt) binary.ByteOrder {
 
 // parseBTF reads a .BTF section into memory and parses it into a list of
 // raw types and a string table.
-func parseBTF(btf io.ReaderAt, bo binary.ByteOrder, baseStrings *stringTable) ([]rawType, *stringTable, error) {
+func parseBTF(btf io.ReaderAt, bo binary.ByteOrder, baseStrings stringTable) ([]rawType, stringTable, error) {
 	buf := internal.NewBufferedSectionReader(btf, 0, math.MaxInt64)
 	header, err := parseBTFHeader(buf, bo)
 	if err != nil {
@@ -496,12 +527,12 @@ func fixupDatasecLayout(ds *Datasec) error {
 }
 
 // Copy creates a copy of Spec.
-func (s *Spec) Copy() *Spec {
+func (s *eagerSpec) Copy() Spec {
 	types := copyTypes(s.types, nil)
 	typeIDs, typesByName := indexTypes(types, s.firstTypeID)
 
 	// NB: Other parts of spec are not copied since they are immutable.
-	return &Spec{
+	return &eagerSpec{
 		types,
 		typeIDs,
 		s.firstTypeID,
@@ -523,7 +554,7 @@ func (sw sliceWriter) Write(p []byte) (int, error) {
 
 // nextTypeID returns the next unallocated type ID or an error if there are no
 // more type IDs.
-func (s *Spec) nextTypeID() (TypeID, error) {
+func (s *eagerSpec) nextTypeID() (TypeID, error) {
 	id := s.firstTypeID + TypeID(len(s.types))
 	if id < s.firstTypeID {
 		return 0, fmt.Errorf("no more type IDs")
@@ -535,7 +566,7 @@ func (s *Spec) nextTypeID() (TypeID, error) {
 //
 // Returns an error wrapping ErrNotFound if a Type with the given ID
 // does not exist in the Spec.
-func (s *Spec) TypeByID(id TypeID) (Type, error) {
+func (s *eagerSpec) TypeByID(id TypeID) (Type, error) {
 	if id < s.firstTypeID {
 		return nil, fmt.Errorf("look up type with ID %d (first ID is %d): %w", id, s.firstTypeID, ErrNotFound)
 	}
@@ -551,7 +582,7 @@ func (s *Spec) TypeByID(id TypeID) (Type, error) {
 // TypeID returns the ID for a given Type.
 //
 // Returns an error wrapping ErrNoFound if the type isn't part of the Spec.
-func (s *Spec) TypeID(typ Type) (TypeID, error) {
+func (s *eagerSpec) TypeID(typ Type) (TypeID, error) {
 	if _, ok := typ.(*Void); ok {
 		// Equality is weird for void, since it is a zero sized type.
 		return 0, nil
@@ -565,6 +596,17 @@ func (s *Spec) TypeID(typ Type) (TypeID, error) {
 	return id, nil
 }
 
+func (s *eagerSpec) anyTypesByKind(kind btfKind) ([]Type, error) {
+	var types []Type
+	for _, typ := range s.types {
+		if typ.kind() == kind {
+			types = append(types, typ)
+		}
+	}
+
+	return types, nil
+}
+
 // AnyTypesByName returns a list of BTF Types with the given name.
 //
 // If the BTF blob describes multiple compilation units like vmlinux, multiple
@@ -572,10 +614,19 @@ func (s *Spec) TypeID(typ Type) (TypeID, error) {
 // data structure.
 //
 // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
-func (s *Spec) AnyTypesByName(name string) ([]Type, error) {
+func (s *eagerSpec) AnyTypesByEssentialName(name string) ([]Type, error) {
 	types := s.namedTypes[newEssentialName(name)]
 	if len(types) == 0 {
 		return nil, fmt.Errorf("type name %s: %w", name, ErrNotFound)
+	}
+
+	return types, nil
+}
+
+func (s *eagerSpec) AnyTypesByName(name string) ([]Type, error) {
+	types, err := s.AnyTypesByEssentialName(name)
+	if err != nil {
+		return nil, err
 	}
 
 	// Return a copy to prevent changes to namedTypes.
@@ -593,7 +644,7 @@ func (s *Spec) AnyTypesByName(name string) ([]Type, error) {
 // AnyTypeByName returns a Type with the given name.
 //
 // Returns an error if multiple types of that name exist.
-func (s *Spec) AnyTypeByName(name string) (Type, error) {
+func (s *eagerSpec) AnyTypeByName(name string) (Type, error) {
 	types, err := s.AnyTypesByName(name)
 	if err != nil {
 		return nil, err
@@ -615,7 +666,7 @@ func (s *Spec) AnyTypeByName(name string) (Type, error) {
 //
 // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
 // Returns an error wrapping ErrMultipleTypes if multiple candidates are found.
-func (s *Spec) TypeByName(name string, typ interface{}) error {
+func (s *eagerSpec) TypeByName(name string, typ interface{}) error {
 	typeInterface := reflect.TypeOf((*Type)(nil)).Elem()
 
 	// typ may be **T or *Type
@@ -670,32 +721,41 @@ func (s *Spec) TypeByName(name string, typ interface{}) error {
 //
 // Types from base are used to resolve references in the split BTF.
 // The returned Spec only contains types from the split BTF, not from the base.
-func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
+func LoadSplitSpecFromReader(r io.ReaderAt, base Spec) (Spec, error) {
 	return loadRawSpec(r, internal.NativeEndian, base)
 }
 
-// TypesIterator iterates over types of a given spec.
-type TypesIterator struct {
+type TypesIterator interface {
+	Next() bool
+	Type() (Type, error)
+}
+
+// eagerTypesIterator iterates over types of a given spec.
+type eagerTypesIterator struct {
 	types []Type
 	index int
 	// The last visited type in the spec.
-	Type Type
+	typ Type
 }
 
 // Iterate returns the types iterator.
-func (s *Spec) Iterate() *TypesIterator {
+func (s *eagerSpec) Iterate() TypesIterator {
 	// We share the backing array of types with the Spec. This is safe since
 	// we don't allow deletion or shuffling of types.
-	return &TypesIterator{types: s.types, index: 0}
+	return &eagerTypesIterator{types: s.types, index: 0}
 }
 
 // Next returns true as long as there are any remaining types.
-func (iter *TypesIterator) Next() bool {
+func (iter *eagerTypesIterator) Next() bool {
 	if len(iter.types) <= iter.index {
 		return false
 	}
 
-	iter.Type = iter.types[iter.index]
+	iter.typ = iter.types[iter.index]
 	iter.index++
 	return true
+}
+
+func (iter *eagerTypesIterator) Type() (Type, error) {
+	return iter.typ, nil
 }

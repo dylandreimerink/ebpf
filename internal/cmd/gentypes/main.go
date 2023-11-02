@@ -67,7 +67,7 @@ func run(args []string) error {
 	return internal.WriteFormatted(output, w)
 }
 
-func generateTypes(spec *btf.Spec) ([]byte, error) {
+func generateTypes(spec btf.Spec) ([]byte, error) {
 	objName := &btf.Array{Nelems: 16, Type: &btf.Int{Encoding: btf.Char, Size: 1}}
 	linkID := &btf.Int{Size: 4}
 	btfID := &btf.Int{Size: 4}

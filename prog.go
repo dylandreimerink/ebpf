@@ -79,7 +79,7 @@ type ProgramOptions struct {
 	// This is useful in environments where the kernel BTF is not available
 	// (containers) or where it is in a non-standard location. Defaults to
 	// use the kernel BTF from a well-known location if nil.
-	KernelTypes *btf.Spec
+	KernelTypes btf.Spec
 }
 
 // ProgramSpec defines a Program.
@@ -937,7 +937,7 @@ func findProgramTargetInKernel(name string, progType ProgramType, attachType Att
 //
 // Returns a non-nil handle if the type was found in a module, or btf.ErrNotFound
 // if the type wasn't found at all.
-func findTargetInKernel(kernelSpec *btf.Spec, typeName string, target *btf.Type) (*btf.Spec, *btf.Handle, error) {
+func findTargetInKernel(kernelSpec btf.Spec, typeName string, target *btf.Type) (btf.Spec, *btf.Handle, error) {
 	err := kernelSpec.TypeByName(typeName, target)
 	if errors.Is(err, btf.ErrNotFound) {
 		spec, module, err := findTargetInModule(kernelSpec, typeName, target)
@@ -958,7 +958,7 @@ func findTargetInKernel(kernelSpec *btf.Spec, typeName string, target *btf.Type)
 // are searched in the order they were loaded.
 //
 // Returns btf.ErrNotFound if the target can't be found in any module.
-func findTargetInModule(base *btf.Spec, typeName string, target *btf.Type) (*btf.Spec, *btf.Handle, error) {
+func findTargetInModule(base btf.Spec, typeName string, target *btf.Type) (btf.Spec, *btf.Handle, error) {
 	it := new(btf.HandleIterator)
 	defer it.Handle.Close()
 

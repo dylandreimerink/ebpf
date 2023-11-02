@@ -14,7 +14,7 @@ import (
 	qt "github.com/frankban/quicktest"
 )
 
-func vmlinuxSpec(tb testing.TB) *Spec {
+func vmlinuxSpec(tb testing.TB) Spec {
 	tb.Helper()
 
 	// /sys/kernel/btf was introduced in 341dfcf8d78e ("btf: expose BTF info
@@ -33,7 +33,7 @@ func vmlinuxSpec(tb testing.TB) *Spec {
 
 type specAndRawBTF struct {
 	raw  []byte
-	spec *Spec
+	spec Spec
 }
 
 var vmlinuxTestdata = internal.Memoize(func() (specAndRawBTF, error) {
@@ -61,7 +61,7 @@ func vmlinuxTestdataReader(tb testing.TB) *bytes.Reader {
 	return bytes.NewReader(td.raw)
 }
 
-func vmlinuxTestdataSpec(tb testing.TB) *Spec {
+func vmlinuxTestdataSpec(tb testing.TB) Spec {
 	tb.Helper()
 
 	td, err := vmlinuxTestdata()
@@ -72,7 +72,7 @@ func vmlinuxTestdataSpec(tb testing.TB) *Spec {
 	return td.spec.Copy()
 }
 
-func parseELFBTF(tb testing.TB, file string) *Spec {
+func parseELFBTF(tb testing.TB, file string) Spec {
 	tb.Helper()
 
 	spec, err := LoadSpec(file)
@@ -225,22 +225,50 @@ func BenchmarkParseVmlinux(b *testing.B) {
 func TestParseCurrentKernelBTF(t *testing.T) {
 	spec := vmlinuxSpec(t)
 
-	if len(spec.namedTypes) == 0 {
-		t.Fatal("Empty kernel BTF")
+	switch spec := spec.(type) {
+	case *eagerSpec:
+		if len(spec.namedTypes) == 0 {
+			t.Fatal("Empty kernel BTF")
+		}
+	case *lazySpec:
+		if len(spec.typeOffsets) == 0 {
+			t.Fatal("Empty kernel BTF")
+		}
 	}
 
+	totalStrings := 0
 	totalBytes := 0
 	distinct := 0
 	seen := make(map[string]bool)
-	for _, str := range spec.strings.strings {
-		totalBytes += len(str)
-		if !seen[str] {
-			distinct++
-			seen[str] = true
+	st := spec.stringTable()
+	switch st := st.(type) {
+	case *eagerStringTable:
+		for _, str := range st.strings {
+			totalStrings++
+			totalBytes += len(str)
+			if !seen[str] {
+				distinct++
+				seen[str] = true
+			}
+		}
+
+	case *lazyStringTable:
+		for _, off := range st.offsets {
+			totalStrings++
+			str, err := st.Lookup(off)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			totalBytes += len(str)
+			if !seen[str] {
+				distinct++
+				seen[str] = true
+			}
 		}
 	}
-	t.Logf("%d strings total, %d distinct", len(spec.strings.strings), distinct)
-	t.Logf("Average string size: %.0f", float64(totalBytes)/float64(len(spec.strings.strings)))
+	t.Logf("%d strings total, %d distinct", totalStrings, distinct)
+	t.Logf("Average string size: %.0f", float64(totalBytes)/float64(totalStrings))
 }
 
 func TestFindVMLinux(t *testing.T) {
@@ -256,8 +284,15 @@ func TestFindVMLinux(t *testing.T) {
 		t.Fatal("Can't load BTF:", err)
 	}
 
-	if len(spec.namedTypes) == 0 {
-		t.Fatal("Empty kernel BTF")
+	switch spec := spec.(type) {
+	case *eagerSpec:
+		if len(spec.namedTypes) == 0 {
+			t.Fatal("Empty kernel BTF")
+		}
+	case *lazySpec:
+		if len(spec.typeOffsets) == 0 {
+			t.Fatal("Empty kernel BTF")
+		}
 	}
 }
 
@@ -339,7 +374,13 @@ func TestSpecCopy(t *testing.T) {
 	cpy := spec.Copy()
 
 	have := typesFromSpec(t, spec)
-	qt.Assert(t, len(spec.types) > 0, qt.IsTrue)
+
+	switch spec := spec.(type) {
+	case *eagerSpec:
+		qt.Assert(t, len(spec.types) > 0, qt.IsTrue)
+	case *lazySpec:
+		qt.Assert(t, len(spec.typeOffsets) > 0, qt.IsTrue)
+	}
 
 	want := typesFromSpec(t, cpy)
 	qt.Assert(t, want, qt.HasLen, len(have))
@@ -370,7 +411,7 @@ func TestSpecTypeByID(t *testing.T) {
 
 func ExampleSpec_TypeByName() {
 	// Acquire a Spec via one of its constructors.
-	spec := new(Spec)
+	spec := new(eagerSpec)
 
 	// Declare a variable of the desired type
 	var foo *Struct
@@ -409,7 +450,12 @@ func TestTypesIterator(t *testing.T) {
 			t.Fatal("Iterator ended early at item", i)
 		}
 
-		qt.Assert(t, iter.Type, qt.DeepEquals, typ)
+		iterTyp, err := iter.Type()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		qt.Assert(t, iterTyp, qt.DeepEquals, typ)
 	}
 
 	if iter.Next() {

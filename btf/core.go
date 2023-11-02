@@ -164,7 +164,7 @@ func (k coreKind) String() string {
 //
 // Fixups are returned in the order of relos, e.g. fixup[i] is the solution
 // for relos[i].
-func CORERelocate(relos []*CORERelocation, target *Spec, bo binary.ByteOrder) ([]COREFixup, error) {
+func CORERelocate(relos []*CORERelocation, target Spec, bo binary.ByteOrder) ([]COREFixup, error) {
 	if target == nil {
 		var err error
 		target, _, err = kernelSpec()
@@ -173,8 +173,8 @@ func CORERelocate(relos []*CORERelocation, target *Spec, bo binary.ByteOrder) ([
 		}
 	}
 
-	if bo != target.byteOrder {
-		return nil, fmt.Errorf("can't relocate %s against %s", bo, target.byteOrder)
+	if bo != target.getByteOrder() {
+		return nil, fmt.Errorf("can't relocate %s against %s", bo, target.getByteOrder())
 	}
 
 	type reloGroup struct {
@@ -221,7 +221,11 @@ func CORERelocate(relos []*CORERelocation, target *Spec, bo binary.ByteOrder) ([
 			return nil, fmt.Errorf("relocate unnamed or anonymous type %s: %w", localType, ErrNotSupported)
 		}
 
-		targets := target.namedTypes[newEssentialName(localTypeName)]
+		targets, err := target.AnyTypesByEssentialName(localTypeName)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, fmt.Errorf("find %s in target: %w", localType, err)
+		}
+
 		fixups, err := coreCalculateFixups(group.relos, target, targets, bo)
 		if err != nil {
 			return nil, fmt.Errorf("relocate %s: %w", localType, err)
@@ -245,7 +249,7 @@ var errIncompatibleTypes = errors.New("incompatible types")
 //
 // The best target is determined by scoring: the less poisoning we have to do
 // the better the target is.
-func coreCalculateFixups(relos []*CORERelocation, targetSpec *Spec, targets []Type, bo binary.ByteOrder) ([]COREFixup, error) {
+func coreCalculateFixups(relos []*CORERelocation, targetSpec Spec, targets []Type, bo binary.ByteOrder) ([]COREFixup, error) {
 	bestScore := len(relos)
 	var bestFixups []COREFixup
 	for _, target := range targets {

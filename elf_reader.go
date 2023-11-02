@@ -34,7 +34,7 @@ type elfCode struct {
 	sections map[elf.SectionIndex]*elfSection
 	license  string
 	version  uint32
-	btf      *btf.Spec
+	btf      btf.Spec
 	extInfo  *btf.ExtInfos
 	maps     map[string]*MapSpec
 	kfuncs   map[string]*btf.Func
@@ -780,7 +780,7 @@ func (ec *elfCode) loadBTFMaps() error {
 // mapSpecFromBTF produces a MapSpec based on a btf.Struct def representing
 // a BTF map definition. The name and spec arguments will be copied to the
 // resulting MapSpec, and inner must be true on any recursive invocations.
-func mapSpecFromBTF(es *elfSection, vs *btf.VarSecinfo, def *btf.Struct, spec *btf.Spec, name string, inner bool) (*MapSpec, error) {
+func mapSpecFromBTF(es *elfSection, vs *btf.VarSecinfo, def *btf.Struct, spec btf.Spec, name string, inner bool) (*MapSpec, error) {
 	var (
 		key, value         btf.Type
 		keySize, valueSize uint32

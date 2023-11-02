@@ -191,7 +191,7 @@ func collectFromSpec(spec *ebpf.CollectionSpec, cTypes []string, skipGlobalTypes
 	return maps, programs, types, nil
 }
 
-func collectCTypes(types *btf.Spec, names []string) ([]btf.Type, error) {
+func collectCTypes(types btf.Spec, names []string) ([]btf.Type, error) {
 	var result []btf.Type
 	for _, cType := range names {
 		typ, err := types.AnyTypeByName(cType)

@@ -47,6 +47,8 @@ type Type interface {
 	// carry a name, like Void and Pointer.
 	TypeName() string
 
+	kind() btfKind
+
 	// Make a copy of the type, without copying Type members.
 	copy() Type
 
@@ -75,6 +77,7 @@ type Void struct{}
 func (v *Void) Format(fs fmt.State, verb rune) { formatType(fs, verb, v) }
 func (v *Void) TypeName() string               { return "" }
 func (v *Void) size() uint32                   { return 0 }
+func (v *Void) kind() btfKind                  { return kindUnknown }
 func (v *Void) copy() Type                     { return (*Void)(nil) }
 
 type IntEncoding byte
@@ -122,6 +125,7 @@ func (i *Int) Format(fs fmt.State, verb rune) {
 
 func (i *Int) TypeName() string { return i.Name }
 func (i *Int) size() uint32     { return i.Size }
+func (i *Int) kind() btfKind    { return kindInt }
 func (i *Int) copy() Type {
 	cpy := *i
 	return &cpy
@@ -138,6 +142,7 @@ func (p *Pointer) Format(fs fmt.State, verb rune) {
 
 func (p *Pointer) TypeName() string { return "" }
 func (p *Pointer) size() uint32     { return 8 }
+func (p *Pointer) kind() btfKind    { return kindPointer }
 func (p *Pointer) copy() Type {
 	cpy := *p
 	return &cpy
@@ -155,6 +160,8 @@ func (arr *Array) Format(fs fmt.State, verb rune) {
 }
 
 func (arr *Array) TypeName() string { return "" }
+
+func (arr *Array) kind() btfKind { return kindArray }
 
 func (arr *Array) copy() Type {
 	cpy := *arr
@@ -176,6 +183,8 @@ func (s *Struct) Format(fs fmt.State, verb rune) {
 func (s *Struct) TypeName() string { return s.Name }
 
 func (s *Struct) size() uint32 { return s.Size }
+
+func (s *Struct) kind() btfKind { return kindStruct }
 
 func (s *Struct) copy() Type {
 	cpy := *s
@@ -202,6 +211,8 @@ func (u *Union) Format(fs fmt.State, verb rune) {
 func (u *Union) TypeName() string { return u.Name }
 
 func (u *Union) size() uint32 { return u.Size }
+
+func (u *Union) kind() btfKind { return kindUnion }
 
 func (u *Union) copy() Type {
 	cpy := *u
@@ -271,7 +282,8 @@ type EnumValue struct {
 	Value uint64
 }
 
-func (e *Enum) size() uint32 { return e.Size }
+func (e *Enum) size() uint32  { return e.Size }
+func (e *Enum) kind() btfKind { return kindEnum }
 func (e *Enum) copy() Type {
 	cpy := *e
 	cpy.Values = make([]EnumValue, len(e.Values))
@@ -311,6 +323,8 @@ func (f *Fwd) Format(fs fmt.State, verb rune) {
 
 func (f *Fwd) TypeName() string { return f.Name }
 
+func (f *Fwd) kind() btfKind { return kindForward }
+
 func (f *Fwd) copy() Type {
 	cpy := *f
 	return &cpy
@@ -328,6 +342,8 @@ func (td *Typedef) Format(fs fmt.State, verb rune) {
 
 func (td *Typedef) TypeName() string { return td.Name }
 
+func (td *Typedef) kind() btfKind { return kindTypedef }
+
 func (td *Typedef) copy() Type {
 	cpy := *td
 	return &cpy
@@ -343,8 +359,8 @@ func (v *Volatile) Format(fs fmt.State, verb rune) {
 }
 
 func (v *Volatile) TypeName() string { return "" }
-
-func (v *Volatile) qualify() Type { return v.Type }
+func (v *Volatile) kind() btfKind    { return kindVolatile }
+func (v *Volatile) qualify() Type    { return v.Type }
 func (v *Volatile) copy() Type {
 	cpy := *v
 	return &cpy
@@ -360,8 +376,8 @@ func (c *Const) Format(fs fmt.State, verb rune) {
 }
 
 func (c *Const) TypeName() string { return "" }
-
-func (c *Const) qualify() Type { return c.Type }
+func (c *Const) kind() btfKind    { return kindConst }
+func (c *Const) qualify() Type    { return c.Type }
 func (c *Const) copy() Type {
 	cpy := *c
 	return &cpy
@@ -377,8 +393,8 @@ func (r *Restrict) Format(fs fmt.State, verb rune) {
 }
 
 func (r *Restrict) TypeName() string { return "" }
-
-func (r *Restrict) qualify() Type { return r.Type }
+func (r *Restrict) kind() btfKind    { return kindRestrict }
+func (r *Restrict) qualify() Type    { return r.Type }
 func (r *Restrict) copy() Type {
 	cpy := *r
 	return &cpy
@@ -408,6 +424,8 @@ func (f *Func) Format(fs fmt.State, verb rune) {
 
 func (f *Func) TypeName() string { return f.Name }
 
+func (f *Func) kind() btfKind { return kindFunc }
+
 func (f *Func) copy() Type {
 	cpy := *f
 	return &cpy
@@ -424,6 +442,8 @@ func (fp *FuncProto) Format(fs fmt.State, verb rune) {
 }
 
 func (fp *FuncProto) TypeName() string { return "" }
+
+func (fp *FuncProto) kind() btfKind { return kindFuncProto }
 
 func (fp *FuncProto) copy() Type {
 	cpy := *fp
@@ -450,6 +470,8 @@ func (v *Var) Format(fs fmt.State, verb rune) {
 
 func (v *Var) TypeName() string { return v.Name }
 
+func (v *Var) kind() btfKind { return kindVar }
+
 func (v *Var) copy() Type {
 	cpy := *v
 	return &cpy
@@ -469,6 +491,8 @@ func (ds *Datasec) Format(fs fmt.State, verb rune) {
 func (ds *Datasec) TypeName() string { return ds.Name }
 
 func (ds *Datasec) size() uint32 { return ds.Size }
+
+func (ds *Datasec) kind() btfKind { return kindDatasec }
 
 func (ds *Datasec) copy() Type {
 	cpy := *ds
@@ -501,6 +525,7 @@ func (f *Float) Format(fs fmt.State, verb rune) {
 
 func (f *Float) TypeName() string { return f.Name }
 func (f *Float) size() uint32     { return f.Size }
+func (f *Float) kind() btfKind    { return kindFloat }
 func (f *Float) copy() Type {
 	cpy := *f
 	return &cpy
@@ -521,6 +546,7 @@ func (dt *declTag) Format(fs fmt.State, verb rune) {
 }
 
 func (dt *declTag) TypeName() string { return "" }
+func (dt *declTag) kind() btfKind    { return kindDeclTag }
 func (dt *declTag) copy() Type {
 	cpy := *dt
 	return &cpy
@@ -538,6 +564,7 @@ func (tt *typeTag) Format(fs fmt.State, verb rune) {
 
 func (tt *typeTag) TypeName() string { return "" }
 func (tt *typeTag) qualify() Type    { return tt.Type }
+func (tt *typeTag) kind() btfKind    { return kindTypeTag }
 func (tt *typeTag) copy() Type {
 	cpy := *tt
 	return &cpy
@@ -551,6 +578,7 @@ type cycle struct {
 func (c *cycle) ID() TypeID                     { return math.MaxUint32 }
 func (c *cycle) Format(fs fmt.State, verb rune) { formatType(fs, verb, c, "root=", c.root) }
 func (c *cycle) TypeName() string               { return "" }
+func (c *cycle) kind() btfKind                  { return kindUnknown }
 func (c *cycle) copy() Type {
 	cpy := *c
 	return &cpy
@@ -735,7 +763,7 @@ type typeDeque = internal.Deque[*Type]
 // Returns a slice of types indexed by TypeID. Since BTF ignores compilation
 // units, multiple types may share the same name. A Type may form a cyclic graph
 // by pointing at itself.
-func inflateRawTypes(rawTypes []rawType, rawStrings *stringTable, base *Spec) ([]Type, error) {
+func inflateRawTypes(rawTypes []rawType, rawStrings stringTable, base Spec) ([]Type, error) {
 	types := make([]Type, 0, len(rawTypes)+1) // +1 for Void added to base types
 
 	// Void is defined to always be type ID 0, and is thus omitted from BTF.

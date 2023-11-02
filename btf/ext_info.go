@@ -24,7 +24,7 @@ type ExtInfos struct {
 // loadExtInfosFromELF parses ext infos from the .BTF.ext section in an ELF.
 //
 // Returns an error wrapping ErrNotFound if no ext infos are present.
-func loadExtInfosFromELF(file *internal.SafeELFFile, spec *Spec) (*ExtInfos, error) {
+func loadExtInfosFromELF(file *internal.SafeELFFile, spec Spec) (*ExtInfos, error) {
 	section := file.Section(".BTF.ext")
 	if section == nil {
 		return nil, fmt.Errorf("btf ext infos: %w", ErrNotFound)
@@ -38,7 +38,7 @@ func loadExtInfosFromELF(file *internal.SafeELFFile, spec *Spec) (*ExtInfos, err
 }
 
 // loadExtInfos parses bare ext infos.
-func loadExtInfos(r io.ReaderAt, bo binary.ByteOrder, spec *Spec) (*ExtInfos, error) {
+func loadExtInfos(r io.ReaderAt, bo binary.ByteOrder, spec Spec) (*ExtInfos, error) {
 	// Open unbuffered section reader. binary.Read() calls io.ReadFull on
 	// the header structs, resulting in one syscall per header.
 	headerRd := io.NewSectionReader(r, 0, math.MaxInt64)
@@ -53,7 +53,7 @@ func loadExtInfos(r io.ReaderAt, bo binary.ByteOrder, spec *Spec) (*ExtInfos, er
 	}
 
 	buf := internal.NewBufferedSectionReader(r, extHeader.funcInfoStart(), int64(extHeader.FuncInfoLen))
-	btfFuncInfos, err := parseFuncInfos(buf, bo, spec.strings)
+	btfFuncInfos, err := parseFuncInfos(buf, bo, spec.stringTable())
 	if err != nil {
 		return nil, fmt.Errorf("parsing BTF function info: %w", err)
 	}
@@ -67,14 +67,14 @@ func loadExtInfos(r io.ReaderAt, bo binary.ByteOrder, spec *Spec) (*ExtInfos, er
 	}
 
 	buf = internal.NewBufferedSectionReader(r, extHeader.lineInfoStart(), int64(extHeader.LineInfoLen))
-	btfLineInfos, err := parseLineInfos(buf, bo, spec.strings)
+	btfLineInfos, err := parseLineInfos(buf, bo, spec.stringTable())
 	if err != nil {
 		return nil, fmt.Errorf("parsing BTF line info: %w", err)
 	}
 
 	lineInfos := make(map[string]LineInfos, len(btfLineInfos))
 	for section, blis := range btfLineInfos {
-		lineInfos[section], err = newLineInfos(blis, spec.strings)
+		lineInfos[section], err = newLineInfos(blis, spec.stringTable())
 		if err != nil {
 			return nil, fmt.Errorf("section %s: line infos: %w", section, err)
 		}
@@ -86,14 +86,14 @@ func loadExtInfos(r io.ReaderAt, bo binary.ByteOrder, spec *Spec) (*ExtInfos, er
 
 	var btfCORERelos map[string][]bpfCORERelo
 	buf = internal.NewBufferedSectionReader(r, extHeader.coreReloStart(coreHeader), int64(coreHeader.COREReloLen))
-	btfCORERelos, err = parseCORERelos(buf, bo, spec.strings)
+	btfCORERelos, err = parseCORERelos(buf, bo, spec.stringTable())
 	if err != nil {
 		return nil, fmt.Errorf("parsing CO-RE relocation info: %w", err)
 	}
 
 	coreRelos := make(map[string]CORERelocationInfos, len(btfCORERelos))
 	for section, brs := range btfCORERelos {
-		coreRelos[section], err = newRelocationInfos(brs, spec, spec.strings)
+		coreRelos[section], err = newRelocationInfos(brs, spec, spec.stringTable())
 		if err != nil {
 			return nil, fmt.Errorf("section %s: CO-RE relocations: %w", section, err)
 		}
@@ -290,7 +290,7 @@ type btfExtInfoSec struct {
 // appearing within func_info and line_info sub-sections.
 // These headers appear once for each program section in the ELF and are
 // followed by one or more func/line_info records for the section.
-func parseExtInfoSec(r io.Reader, bo binary.ByteOrder, strings *stringTable) (string, *btfExtInfoSec, error) {
+func parseExtInfoSec(r io.Reader, bo binary.ByteOrder, strings stringTable) (string, *btfExtInfoSec, error) {
 	var infoHeader btfExtInfoSec
 	if err := binary.Read(r, bo, &infoHeader); err != nil {
 		return "", nil, fmt.Errorf("read ext info header: %w", err)
@@ -352,7 +352,7 @@ type bpfFuncInfo struct {
 	TypeID  TypeID
 }
 
-func newFuncInfo(fi bpfFuncInfo, spec *Spec) (*funcInfo, error) {
+func newFuncInfo(fi bpfFuncInfo, spec Spec) (*funcInfo, error) {
 	typ, err := spec.TypeByID(fi.TypeID)
 	if err != nil {
 		return nil, err
@@ -374,7 +374,7 @@ func newFuncInfo(fi bpfFuncInfo, spec *Spec) (*funcInfo, error) {
 	}, nil
 }
 
-func newFuncInfos(bfis []bpfFuncInfo, spec *Spec) (FuncInfos, error) {
+func newFuncInfos(bfis []bpfFuncInfo, spec Spec) (FuncInfos, error) {
 	fis := FuncInfos{
 		infos: make([]funcInfo, 0, len(bfis)),
 	}
@@ -392,7 +392,7 @@ func newFuncInfos(bfis []bpfFuncInfo, spec *Spec) (FuncInfos, error) {
 }
 
 // LoadFuncInfos parses BTF func info in kernel wire format.
-func LoadFuncInfos(reader io.Reader, bo binary.ByteOrder, recordNum uint32, spec *Spec) (FuncInfos, error) {
+func LoadFuncInfos(reader io.Reader, bo binary.ByteOrder, recordNum uint32, spec Spec) (FuncInfos, error) {
 	fis, err := parseFuncInfoRecords(
 		reader,
 		bo,
@@ -426,7 +426,7 @@ func (fi *funcInfo) marshal(w *bytes.Buffer, b *Builder) error {
 
 // parseFuncInfos parses a func_info sub-section within .BTF.ext ito a map of
 // func infos indexed by section name.
-func parseFuncInfos(r io.Reader, bo binary.ByteOrder, strings *stringTable) (map[string][]bpfFuncInfo, error) {
+func parseFuncInfos(r io.Reader, bo binary.ByteOrder, strings stringTable) (map[string][]bpfFuncInfo, error) {
 	recordSize, err := parseExtInfoRecordSize(r, bo)
 	if err != nil {
 		return nil, err
@@ -541,7 +541,7 @@ type bpfLineInfo struct {
 }
 
 // LoadLineInfos parses BTF line info in kernel wire format.
-func LoadLineInfos(reader io.Reader, bo binary.ByteOrder, recordNum uint32, spec *Spec) (LineInfos, error) {
+func LoadLineInfos(reader io.Reader, bo binary.ByteOrder, recordNum uint32, spec Spec) (LineInfos, error) {
 	lis, err := parseLineInfoRecords(
 		reader,
 		bo,
@@ -553,10 +553,10 @@ func LoadLineInfos(reader io.Reader, bo binary.ByteOrder, recordNum uint32, spec
 		return LineInfos{}, fmt.Errorf("parsing BTF line info: %w", err)
 	}
 
-	return newLineInfos(lis, spec.strings)
+	return newLineInfos(lis, spec.stringTable())
 }
 
-func newLineInfo(li bpfLineInfo, strings *stringTable) (*lineInfo, error) {
+func newLineInfo(li bpfLineInfo, strings stringTable) (*lineInfo, error) {
 	line, err := strings.Lookup(li.LineOff)
 	if err != nil {
 		return nil, fmt.Errorf("lookup of line: %w", err)
@@ -581,7 +581,7 @@ func newLineInfo(li bpfLineInfo, strings *stringTable) (*lineInfo, error) {
 	}, nil
 }
 
-func newLineInfos(blis []bpfLineInfo, strings *stringTable) (LineInfos, error) {
+func newLineInfos(blis []bpfLineInfo, strings stringTable) (LineInfos, error) {
 	lis := LineInfos{
 		infos: make([]lineInfo, 0, len(blis)),
 	}
@@ -637,7 +637,7 @@ func (li *lineInfo) marshal(w *bytes.Buffer, b *Builder) error {
 
 // parseLineInfos parses a line_info sub-section within .BTF.ext ito a map of
 // line infos indexed by section name.
-func parseLineInfos(r io.Reader, bo binary.ByteOrder, strings *stringTable) (map[string][]bpfLineInfo, error) {
+func parseLineInfos(r io.Reader, bo binary.ByteOrder, strings stringTable) (map[string][]bpfLineInfo, error) {
 	recordSize, err := parseExtInfoRecordSize(r, bo)
 	if err != nil {
 		return nil, err
@@ -731,7 +731,7 @@ type coreRelocationInfo struct {
 	offset asm.RawInstructionOffset
 }
 
-func newRelocationInfo(relo bpfCORERelo, spec *Spec, strings *stringTable) (*coreRelocationInfo, error) {
+func newRelocationInfo(relo bpfCORERelo, spec Spec, strings stringTable) (*coreRelocationInfo, error) {
 	typ, err := spec.TypeByID(relo.TypeID)
 	if err != nil {
 		return nil, err
@@ -758,7 +758,7 @@ func newRelocationInfo(relo bpfCORERelo, spec *Spec, strings *stringTable) (*cor
 	}, nil
 }
 
-func newRelocationInfos(brs []bpfCORERelo, spec *Spec, strings *stringTable) (CORERelocationInfos, error) {
+func newRelocationInfos(brs []bpfCORERelo, spec Spec, strings stringTable) (CORERelocationInfos, error) {
 	rs := CORERelocationInfos{
 		infos: make([]coreRelocationInfo, 0, len(brs)),
 	}
@@ -779,7 +779,7 @@ var extInfoReloSize = binary.Size(bpfCORERelo{})
 
 // parseCORERelos parses a core_relos sub-section within .BTF.ext ito a map of
 // CO-RE relocations indexed by section name.
-func parseCORERelos(r io.Reader, bo binary.ByteOrder, strings *stringTable) (map[string][]bpfCORERelo, error) {
+func parseCORERelos(r io.Reader, bo binary.ByteOrder, strings stringTable) (map[string][]bpfCORERelo, error) {
 	recordSize, err := parseExtInfoRecordSize(r, bo)
 	if err != nil {
 		return nil, err

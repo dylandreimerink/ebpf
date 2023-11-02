@@ -38,8 +38,18 @@ func FuzzSpec(f *testing.F) {
 			t.Fatal("spec is nil")
 		}
 
-		for _, typ := range spec.types {
-			fmt.Fprintf(io.Discard, "%+10v", typ)
+		switch spec := spec.(type) {
+		case *eagerSpec:
+			for _, typ := range spec.types {
+				fmt.Fprintf(io.Discard, "%+10v", typ)
+			}
+		case *lazySpec:
+			for i := TypeID(0); i < TypeID(len(spec.typeOffsets)); i++ {
+				_, err := spec.TypeByID(i + 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 		}
 	})
 }
@@ -67,7 +77,12 @@ func FuzzExtInfo(f *testing.F) {
 		}
 
 		emptySpec := specFromTypes(t, nil)
-		emptySpec.strings = table
+		switch emptySpec := emptySpec.(type) {
+		case *eagerSpec:
+			emptySpec.strings = table
+		case *lazySpec:
+			emptySpec.strings = table
+		}
 
 		info, err := loadExtInfos(bytes.NewReader(data), internal.NativeEndian, emptySpec)
 		if err != nil {

@@ -12,8 +12,18 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-type stringTable struct {
-	base    *stringTable
+type stringTable interface {
+	Lookup(offset uint32) (string, error)
+	ForEach(func(uint32, string) error) error
+	Marshal(w io.Writer) error
+	Num() int
+
+	lookup(offset uint32) (string, error)
+	nextOffset() uint32
+}
+
+type eagerStringTable struct {
+	base    stringTable
 	offsets []uint32
 	strings []string
 }
@@ -24,13 +34,12 @@ type sizedReader interface {
 	Size() int64
 }
 
-func readStringTable(r sizedReader, base *stringTable) (*stringTable, error) {
+func readStringTable(r sizedReader, base stringTable) (stringTable, error) {
 	// When parsing split BTF's string table, the first entry offset is derived
 	// from the last entry offset of the base BTF.
 	firstStringOffset := uint32(0)
 	if base != nil {
-		idx := len(base.offsets) - 1
-		firstStringOffset = base.offsets[idx] + uint32(len(base.strings[idx])) + 1
+		firstStringOffset = base.nextOffset()
 	}
 
 	// Derived from vmlinux BTF.
@@ -61,7 +70,7 @@ func readStringTable(r sizedReader, base *stringTable) (*stringTable, error) {
 		return nil, errors.New("first item in string table is non-empty")
 	}
 
-	return &stringTable{base, offsets, strings}, nil
+	return &eagerStringTable{base, offsets, strings}, nil
 }
 
 func splitNull(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -76,14 +85,29 @@ func splitNull(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	return i + 1, data[:i], nil
 }
 
-func (st *stringTable) Lookup(offset uint32) (string, error) {
-	if st.base != nil && offset <= st.base.offsets[len(st.base.offsets)-1] {
+func (st *eagerStringTable) nextOffset() uint32 {
+	idx := len(st.offsets) - 1
+	return st.offsets[idx] + uint32(len(st.strings[idx])) + 1
+}
+
+func (st *eagerStringTable) Lookup(offset uint32) (string, error) {
+	if st.base != nil && offset < st.base.nextOffset() {
 		return st.base.lookup(offset)
 	}
 	return st.lookup(offset)
 }
 
-func (st *stringTable) lookup(offset uint32) (string, error) {
+func (st *eagerStringTable) ForEach(fn func(uint32, string) error) error {
+	for i, offset := range st.offsets {
+		if err := fn(offset, st.strings[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (st *eagerStringTable) lookup(offset uint32) (string, error) {
 	i, found := slices.BinarySearch(st.offsets, offset)
 	if !found {
 		return "", fmt.Errorf("offset %d isn't start of a string", offset)
@@ -92,7 +116,7 @@ func (st *stringTable) lookup(offset uint32) (string, error) {
 	return st.strings[i], nil
 }
 
-func (st *stringTable) Marshal(w io.Writer) error {
+func (st *eagerStringTable) Marshal(w io.Writer) error {
 	for _, str := range st.strings {
 		_, err := io.WriteString(w, str)
 		if err != nil {
@@ -107,7 +131,7 @@ func (st *stringTable) Marshal(w io.Writer) error {
 }
 
 // Num returns the number of strings in the table.
-func (st *stringTable) Num() int {
+func (st *eagerStringTable) Num() int {
 	return len(st.strings)
 }
 

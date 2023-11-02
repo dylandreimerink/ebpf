@@ -37,7 +37,22 @@ func TestBuilderMarshal(t *testing.T) {
 
 	have, err := loadRawSpec(bytes.NewReader(buf), internal.NativeEndian, nil)
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("Couldn't parse BTF"))
-	qt.Assert(t, have.types, qt.DeepEquals, want)
+
+	typ0, err := have.TypeByID(0)
+	qt.Assert(t, err, qt.IsNil)
+	qt.Assert(t, typ0, qt.DeepEquals, want[0])
+
+	typ1, err := have.TypeByID(1)
+	qt.Assert(t, err, qt.IsNil)
+	qt.Assert(t, typ1, qt.DeepEquals, want[1])
+
+	typ2, err := have.TypeByID(2)
+	qt.Assert(t, err, qt.IsNil)
+	qt.Assert(t, typ2, qt.DeepEquals, want[2])
+
+	typ3, err := have.TypeByID(3)
+	qt.Assert(t, err, qt.IsNil)
+	qt.Assert(t, typ3, qt.DeepEquals, want[3])
 }
 
 func TestBuilderAdd(t *testing.T) {
@@ -105,8 +120,15 @@ limitTypes:
 	rebuilt, err := loadRawSpec(bytes.NewReader(buf), binary.LittleEndian, nil)
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("round tripping BTF failed"))
 
-	if n := len(rebuilt.types); n > math.MaxUint16 {
-		t.Logf("Rebuilt BTF contains %d types which exceeds uint16, test may fail on older kernels", n)
+	switch rebuilt := rebuilt.(type) {
+	case *eagerSpec:
+		if n := len(rebuilt.types); n > math.MaxUint16 {
+			t.Logf("Rebuilt BTF contains %d types which exceeds uint16, test may fail on older kernels", n)
+		}
+	case *lazySpec:
+		if n := len(rebuilt.types); n > math.MaxUint16 {
+			t.Logf("Rebuilt BTF contains %d types which exceeds uint16, test may fail on older kernels", n)
+		}
 	}
 
 	h, err := NewHandleFromRawBTF(buf)
@@ -192,7 +214,7 @@ func marshalNativeEndian(tb testing.TB, types []Type) []byte {
 	return buf
 }
 
-func specFromTypes(tb testing.TB, types []Type) *Spec {
+func specFromTypes(tb testing.TB, types []Type) Spec {
 	tb.Helper()
 
 	btf := marshalNativeEndian(tb, types)
@@ -202,13 +224,15 @@ func specFromTypes(tb testing.TB, types []Type) *Spec {
 	return spec
 }
 
-func typesFromSpec(tb testing.TB, spec *Spec) []Type {
+func typesFromSpec(tb testing.TB, spec Spec) []Type {
 	tb.Helper()
 
 	var types []Type
 	iter := spec.Iterate()
 	for iter.Next() {
-		types = append(types, iter.Type)
+		typ, err := iter.Type()
+		qt.Assert(tb, err, qt.IsNil)
+		types = append(types, typ)
 	}
 
 	return types
