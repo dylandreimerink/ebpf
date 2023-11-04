@@ -209,12 +209,7 @@ func loadRawSpec(btf io.Reader, bo binary.ByteOrder, base *Spec) (*Spec, error) 
 		}
 	}
 
-	rawTypes, rawStrings, err := parseBTF(btf, bo, baseStrings)
-	if err != nil {
-		return nil, err
-	}
-
-	types, err := inflateRawTypes(rawTypes, rawStrings, base)
+	types, rawStrings, err := parseBTF(btf, bo, baseStrings, base)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +368,7 @@ func guessRawBTFByteOrder(r io.ReaderAt) binary.ByteOrder {
 
 // parseBTF reads a .BTF section into memory and parses it into a list of
 // raw types and a string table.
-func parseBTF(btf io.Reader, bo binary.ByteOrder, baseStrings *stringTable) ([]rawType, *stringTable, error) {
+func parseBTF(btf io.Reader, bo binary.ByteOrder, baseStrings *stringTable, base *Spec) ([]Type, *stringTable, error) {
 	header, err := parseBTFHeader(btf, bo)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing .BTF header: %v", err)
@@ -394,12 +389,12 @@ func parseBTF(btf io.Reader, bo binary.ByteOrder, baseStrings *stringTable) ([]r
 		return nil, nil, fmt.Errorf("can't read type names: %w", err)
 	}
 
-	rawTypes, err := readTypes(btfBytes[header.TypeOff:header.TypeOff+header.TypeLen], bo, header.TypeLen)
+	types, err := inflateRawTypes(btfBytes[header.TypeOff:header.TypeOff+header.TypeLen], bo, header.TypeLen, rawStrings, base)
 	if err != nil {
-		return nil, nil, fmt.Errorf("can't read types: %w", err)
+		return nil, nil, err
 	}
 
-	return rawTypes, rawStrings, nil
+	return types, rawStrings, nil
 }
 
 type symbol struct {
