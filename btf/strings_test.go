@@ -2,7 +2,6 @@ package btf
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 
 	qt "github.com/frankban/quicktest"
@@ -12,7 +11,7 @@ func TestStringTable(t *testing.T) {
 	const in = "\x00one\x00two\x00"
 	const splitIn = "three\x00four\x00"
 
-	st, err := readStringTable(strings.NewReader(in), nil)
+	st, err := readStringTable([]byte(in), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +26,7 @@ func TestStringTable(t *testing.T) {
 	}
 
 	// Parse string table of split BTF
-	split, err := readStringTable(strings.NewReader(splitIn), st)
+	split, err := readStringTable([]byte(splitIn), st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,12 +59,12 @@ func TestStringTable(t *testing.T) {
 	}
 
 	// Make sure we reject bogus tables
-	_, err = readStringTable(strings.NewReader("\x00one"), nil)
+	_, err = readStringTable([]byte("\x00one"), nil)
 	if err == nil {
 		t.Fatal("Accepted non-terminated string")
 	}
 
-	_, err = readStringTable(strings.NewReader("one\x00"), nil)
+	_, err = readStringTable([]byte("one\x00"), nil)
 	if err == nil {
 		t.Fatal("Accepted non-empty first item")
 	}
@@ -74,7 +73,7 @@ func TestStringTable(t *testing.T) {
 func TestStringTableBuilder(t *testing.T) {
 	stb := newStringTableBuilder(0)
 
-	_, err := readStringTable(bytes.NewReader(stb.AppendEncoded(nil)), nil)
+	_, err := readStringTable(stb.AppendEncoded(nil), nil)
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("Can't parse string table"))
 
 	_, err = stb.Add("foo\x00bar")
@@ -93,7 +92,7 @@ func TestStringTableBuilder(t *testing.T) {
 		t.Fatalf("Marshalled string table contains foo %d times instead of once", n)
 	}
 
-	_, err = readStringTable(bytes.NewReader(table), nil)
+	_, err = readStringTable(table, nil)
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("Can't parse string table"))
 }
 

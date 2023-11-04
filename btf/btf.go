@@ -176,7 +176,7 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 		return nil, fmt.Errorf("compressed BTF is not supported")
 	}
 
-	spec, err := loadRawSpec(btfSection.ReaderAt, file.ByteOrder, nil)
+	spec, err := loadRawSpec(btfSection.Open(), file.ByteOrder, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +189,7 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 	return spec, nil
 }
 
-func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, base *Spec) (*Spec, error) {
+func loadRawSpec(btf io.Reader, bo binary.ByteOrder, base *Spec) (*Spec, error) {
 	var (
 		baseStrings *stringTable
 		firstTypeID TypeID
@@ -373,21 +373,28 @@ func guessRawBTFByteOrder(r io.ReaderAt) binary.ByteOrder {
 
 // parseBTF reads a .BTF section into memory and parses it into a list of
 // raw types and a string table.
-func parseBTF(btf io.ReaderAt, bo binary.ByteOrder, baseStrings *stringTable) ([]rawType, *stringTable, error) {
-	buf := internal.NewBufferedSectionReader(btf, 0, math.MaxInt64)
-	header, err := parseBTFHeader(buf, bo)
+func parseBTF(btf io.Reader, bo binary.ByteOrder, baseStrings *stringTable) ([]rawType, *stringTable, error) {
+	header, err := parseBTFHeader(btf, bo)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing .BTF header: %v", err)
 	}
 
-	rawStrings, err := readStringTable(io.NewSectionReader(btf, header.stringStart(), int64(header.StringLen)),
-		baseStrings)
+	size := header.StringOff + header.StringLen
+	if typSize := header.TypeOff + header.TypeLen; typSize > size {
+		size = typSize
+	}
+
+	btfBytes := make([]byte, size)
+	if _, err := io.ReadFull(btf, btfBytes); err != nil {
+		return nil, nil, fmt.Errorf("reading BTF remainder: %v", err)
+	}
+
+	rawStrings, err := readStringTable(btfBytes[header.StringOff:header.StringOff+header.StringLen], baseStrings)
 	if err != nil {
 		return nil, nil, fmt.Errorf("can't read type names: %w", err)
 	}
 
-	buf.Reset(io.NewSectionReader(btf, header.typeStart(), int64(header.TypeLen)))
-	rawTypes, err := readTypes(buf, bo, header.TypeLen)
+	rawTypes, err := readTypes(btfBytes[header.TypeOff:header.TypeOff+header.TypeLen], bo, header.TypeLen)
 	if err != nil {
 		return nil, nil, fmt.Errorf("can't read types: %w", err)
 	}
@@ -670,7 +677,7 @@ func (s *Spec) TypeByName(name string, typ interface{}) error {
 //
 // Types from base are used to resolve references in the split BTF.
 // The returned Spec only contains types from the split BTF, not from the base.
-func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
+func LoadSplitSpecFromReader(r io.Reader, base *Spec) (*Spec, error) {
 	return loadRawSpec(r, internal.NativeEndian, base)
 }
 

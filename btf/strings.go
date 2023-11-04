@@ -1,7 +1,6 @@
 package btf
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -24,7 +23,7 @@ type sizedReader interface {
 	Size() int64
 }
 
-func readStringTable(r sizedReader, base *stringTable) (*stringTable, error) {
+func readStringTable(strBytes []byte, base *stringTable) (*stringTable, error) {
 	// When parsing split BTF's string table, the first entry offset is derived
 	// from the last entry offset of the base BTF.
 	firstStringOffset := uint32(0)
@@ -36,25 +35,28 @@ func readStringTable(r sizedReader, base *stringTable) (*stringTable, error) {
 	// Derived from vmlinux BTF.
 	const averageStringLength = 16
 
-	n := int(r.Size() / averageStringLength)
+	n := int(len(strBytes) / averageStringLength)
 	offsets := make([]uint32, 0, n)
 	strings := make([]string, 0, n)
 
-	offset := firstStringOffset
-	scanner := bufio.NewScanner(r)
-	scanner.Split(splitNull)
-	for scanner.Scan() {
-		str := scanner.Text()
-		offsets = append(offsets, offset)
+	i := 0
+	for {
+		j := bytes.IndexByte(strBytes[i:], 0)
+		if j == -1 {
+			break
+		}
+		str := string(strBytes[i : i+j])
+		offsets = append(offsets, firstStringOffset+uint32(i))
 		strings = append(strings, str)
-		offset += uint32(len(str)) + 1
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+		i += j + 1
 	}
 
 	if len(strings) == 0 {
 		return nil, errors.New("string table is empty")
+	}
+
+	if len(strBytes) > 0 && strBytes[len(strBytes)-1] != 0 {
+		return nil, errors.New("string table isn't null terminated")
 	}
 
 	if firstStringOffset == 0 && strings[0] != "" {

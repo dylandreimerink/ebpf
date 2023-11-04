@@ -61,7 +61,7 @@ func FuzzExtInfo(f *testing.F) {
 			t.Skip("data is too short")
 		}
 
-		table, err := readStringTable(bytes.NewReader(strings), nil)
+		table, err := readStringTable(strings, nil)
 		if err != nil {
 			t.Skip("invalid string table")
 		}
