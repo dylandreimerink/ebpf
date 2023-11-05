@@ -389,7 +389,7 @@ func parseBTF(btf io.Reader, bo binary.ByteOrder, baseStrings *stringTable, base
 		return nil, nil, fmt.Errorf("can't read type names: %w", err)
 	}
 
-	types, err := inflateRawTypes(btfBytes[header.TypeOff:header.TypeOff+header.TypeLen], bo, header.TypeLen, rawStrings, base)
+	types, err := readAndParseType(btfBytes[header.TypeOff:header.TypeOff+header.TypeLen], bo, header.TypeLen, rawStrings, base)
 	if err != nil {
 		return nil, nil, err
 	}

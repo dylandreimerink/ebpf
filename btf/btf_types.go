@@ -518,3 +518,75 @@ func unmarshalBtfDeclTag(bdt *btfDeclTag, b []byte, bo binary.ByteOrder) (int, e
 	bdt.ComponentIdx = bo.Uint32(b[0:])
 	return btfDeclTagLen, nil
 }
+
+func readTypeOffsets(types []byte, bo binary.ByteOrder, typeLen uint32) ([]int, error) {
+	var header btfType
+	// because of the interleaving between types and struct members it is difficult to
+	// precompute the numbers of raw types this will parse
+	// this "guess" is a good first estimation
+	sizeOfbtfType := uintptr(btfTypeLen)
+	tyMaxCount := uintptr(typeLen) / sizeOfbtfType / 2
+	offsets := make([]int, 0, tyMaxCount)
+	// First offset is reserved for the void type
+	offsets = append(offsets, -1)
+
+	offset := int(0)
+
+	// Pull equality check out of the loop
+	le := bo == binary.LittleEndian
+
+	for id := TypeID(1); ; id++ {
+		if offset+int(btfTypeSize) > int(len(types)) {
+			return offsets, nil
+		}
+
+		offsets = append(offsets, offset)
+
+		// Discard `NameOff``
+		offset += 4
+
+		// Copy binary.ByteOrder.Uint32, this avoids the function call overhead
+		if le {
+			header.Info = uint32(types[offset+0]) | uint32(types[offset+1])<<8 | uint32(types[offset+2])<<16 | uint32(types[offset+3])<<24
+		} else {
+			header.Info = uint32(types[offset+3]) | uint32(types[offset+2])<<8 | uint32(types[offset+1])<<16 | uint32(types[offset+0])<<24
+		}
+
+		// Discard `SizeType`
+		offset += 8
+
+		switch header.Kind() {
+		case kindInt:
+			offset += btfIntLen
+		case kindPointer:
+		case kindArray:
+			offset += btfArrayLen
+		case kindStruct:
+			fallthrough
+		case kindUnion:
+			offset += btfMemberLen * header.Vlen()
+		case kindEnum:
+			offset += btfEnumLen * header.Vlen()
+		case kindForward:
+		case kindTypedef:
+		case kindVolatile:
+		case kindConst:
+		case kindRestrict:
+		case kindFunc:
+		case kindFuncProto:
+			offset += btfParamLen * header.Vlen()
+		case kindVar:
+			offset += btfVariableLen
+		case kindDatasec:
+			offset += btfVarSecinfoLen * header.Vlen()
+		case kindFloat:
+		case kindDeclTag:
+			offset += btfDeclTagLen
+		case kindTypeTag:
+		case kindEnum64:
+			offset += btfEnum64Len * header.Vlen()
+		default:
+			return nil, fmt.Errorf("type id %v: unknown kind: %v", id, header.Kind())
+		}
+	}
+}

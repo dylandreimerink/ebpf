@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strings"
 
 	"github.com/cilium/ebpf/asm"
@@ -727,23 +728,44 @@ func (c *copier) copy(typ *Type, transform Transformer) {
 
 type typeDeque = internal.Deque[*Type]
 
-// inflateRawTypes takes a list of raw btf types linked via type IDs, and turns
-// it into a graph of Types connected via pointers.
-//
-// If base is provided, then the raw types are considered to be of a split BTF
-// (e.g., a kernel module).
-//
-// Returns a slice of types indexed by TypeID. Since BTF ignores compilation
-// units, multiple types may share the same name. A Type may form a cyclic graph
-// by pointing at itself.
-func inflateRawTypes(typesBytes []byte, bo binary.ByteOrder, typeLen uint32, rawStrings *stringTable, base *Spec) ([]Type, error) {
-	sizeOfbtfType := uintptr(btfTypeLen)
-	tyMaxCount := uintptr(typeLen) / sizeOfbtfType / 2
+type typeDecoder struct {
+	bo          binary.ByteOrder
+	btfBytes    []byte
+	stringTable *stringTable
+	typeOffsets []int
+	base        *Spec
 
-	types := make([]Type, 0, tyMaxCount+1) // +1 for Void added to base types
+	types       []Type
+	firstTypeID TypeID
+
+	legacyBitfields map[TypeID][2]Bits
+
+	fixups            []fixupDef
+	bitfieldFixups    []bitfieldFixupDef
+	uncheckedDeclTags []*declTag
+
+	header    btfType
+	bInt      btfInt
+	bArr      btfArray
+	bMembers  []btfMember
+	bEnums    []btfEnum
+	bParams   []btfParam
+	bVariable btfVariable
+	bSecInfos []btfVarSecinfo
+	bDeclTag  btfDeclTag
+	bEnums64  []btfEnum64
+}
+
+func newDecoder(btfBytes []byte, bo binary.ByteOrder, typeLen uint32, stringTable *stringTable, base *Spec) (*typeDecoder, error) {
+	offsets, err := readTypeOffsets(btfBytes, bo, typeLen)
+	if err != nil {
+		return nil, err
+	}
+
+	types := make([]Type, len(offsets))
 
 	// Void is defined to always be type ID 0, and is thus omitted from BTF.
-	types = append(types, (*Void)(nil))
+	types[0] = (*Void)(nil)
 
 	firstTypeID := TypeID(0)
 	if base != nil {
@@ -754,433 +776,492 @@ func inflateRawTypes(typesBytes []byte, bo binary.ByteOrder, typeLen uint32, raw
 		}
 
 		// Split BTF doesn't contain Void.
-		types = types[:0]
+		types = types[1:]
+		offsets = offsets[1:]
 	}
 
-	type fixupDef struct {
-		id  TypeID
-		typ *Type
+	return &typeDecoder{
+		base:        base,
+		bo:          bo,
+		stringTable: stringTable,
+		btfBytes:    btfBytes,
+		typeOffsets: offsets,
+
+		types:       types,
+		firstTypeID: firstTypeID,
+
+		legacyBitfields: make(map[TypeID][2]Bits),
+	}, nil
+}
+
+func (d *typeDecoder) Decode(id TypeID) (Type, error) {
+	if id < d.firstTypeID {
+		return nil, fmt.Errorf("type id %d is not in split BTF", id)
 	}
 
-	var fixups []fixupDef
-	fixup := func(id TypeID, typ *Type) {
-		if id < firstTypeID {
-			if baseType, err := base.TypeByID(id); err == nil {
-				*typ = baseType
-				return
-			}
+	if int(id-d.firstTypeID) >= len(d.types) {
+		return nil, os.ErrNotExist
+	}
+
+	if typ := d.types[id-d.firstTypeID]; typ != nil {
+		return typ, nil
+	}
+
+	typ, err := d.decode(id)
+	if err != nil {
+		return nil, err
+	}
+
+	d.types[id-d.firstTypeID] = typ
+
+	if err := d.applyFixups(); err != nil {
+		return nil, err
+	}
+
+	return typ, nil
+}
+
+func (d *typeDecoder) applyFixups() error {
+	for _, fixup := range d.fixups {
+		if fixup.id < d.firstTypeID {
+			return fmt.Errorf("fixup for base type id %d is not expected", fixup.id)
 		}
 
-		idx := int(id - firstTypeID)
-		if idx < len(types) {
-			// We've already inflated this type, fix it up immediately.
-			*typ = types[idx]
-			return
+		idx := int(fixup.id - d.firstTypeID)
+		if idx >= len(d.types) {
+			return fmt.Errorf("reference to invalid type id: %d", fixup.id)
 		}
 
-		fixups = append(fixups, fixupDef{id, typ})
-	}
-
-	type bitfieldFixupDef struct {
-		id TypeID
-		m  *Member
-	}
-
-	var (
-		legacyBitfields = make(map[TypeID][2]Bits) // offset, size
-		bitfieldFixups  []bitfieldFixupDef
-	)
-	convertMembers := func(raw []btfMember, kindFlag bool) ([]Member, error) {
-		// NB: The fixup below relies on pre-allocating this array to
-		// work, since otherwise append might re-allocate members.
-		members := make([]Member, 0, len(raw))
-		for i, btfMember := range raw {
-			name, err := rawStrings.Lookup(btfMember.NameOff)
-			if err != nil {
-				return nil, fmt.Errorf("can't get name for member %d: %w", i, err)
-			}
-
-			members = append(members, Member{
-				Name:   name,
-				Offset: Bits(btfMember.Offset),
-			})
-
-			m := &members[i]
-			fixup(raw[i].Type, &m.Type)
-
-			if kindFlag {
-				m.BitfieldSize = Bits(btfMember.Offset >> 24)
-				m.Offset &= 0xffffff
-				// We ignore legacy bitfield definitions if the current composite
-				// is a new-style bitfield. This is kind of safe since offset and
-				// size on the type of the member must be zero if kindFlat is set
-				// according to spec.
-				continue
-			}
-
-			// This may be a legacy bitfield, try to fix it up.
-			data, ok := legacyBitfields[raw[i].Type]
-			if ok {
-				// Bingo!
-				m.Offset += data[0]
-				m.BitfieldSize = data[1]
-				continue
-			}
-
-			if m.Type != nil {
-				// We couldn't find a legacy bitfield, but we know that the member's
-				// type has already been inflated. Hence we know that it can't be
-				// a legacy bitfield and there is nothing left to do.
-				continue
-			}
-
-			// We don't have fixup data, and the type we're pointing
-			// at hasn't been inflated yet. No choice but to defer
-			// the fixup.
-			bitfieldFixups = append(bitfieldFixups, bitfieldFixupDef{
-				raw[i].Type,
-				m,
-			})
-		}
-		return members, nil
-	}
-
-	var declTags []*declTag
-
-	var (
-		header    btfType
-		bInt      btfInt
-		bArr      btfArray
-		bMembers  []btfMember
-		bEnums    []btfEnum
-		bParams   []btfParam
-		bVariable btfVariable
-		bSecInfos []btfVarSecinfo
-		bDeclTag  btfDeclTag
-		bEnums64  []btfEnum64
-	)
-
-	off := 0
-	for {
-		n, err := unmarshalBtfType(&header, typesBytes[off:], bo)
+		var err error
+		*fixup.typ, err = d.Decode(fixup.id)
 		if err != nil {
-			break
+			return fmt.Errorf("fixup for type id %d: %w", fixup.id, err)
 		}
-
-		off += n
-
-		var (
-			id  = firstTypeID + TypeID(len(types))
-			typ Type
-		)
-
-		if id < firstTypeID {
-			return nil, fmt.Errorf("no more type IDs")
-		}
-
-		name, err := rawStrings.Lookup(header.NameOff)
-		if err != nil {
-			return nil, fmt.Errorf("get name for type id %d: %w", id, err)
-		}
-
-		switch header.Kind() {
-		case kindInt:
-			n, err := unmarshalBtfInt(&bInt, typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			size := header.Size()
-			if bInt.Offset() > 0 || bInt.Bits().Bytes() != size {
-				legacyBitfields[id] = [2]Bits{bInt.Offset(), bInt.Bits()}
-			}
-			typ = &Int{name, header.Size(), bInt.Encoding()}
-
-		case kindPointer:
-			ptr := &Pointer{nil}
-			fixup(header.Type(), &ptr.Target)
-			typ = ptr
-
-		case kindArray:
-			n, err := unmarshalBtfArray(&bArr, typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			arr := &Array{nil, nil, bArr.Nelems}
-			fixup(bArr.IndexType, &arr.Index)
-			fixup(bArr.Type, &arr.Type)
-			typ = arr
-
-		case kindStruct:
-			vlen := header.Vlen()
-			if len(bMembers) < vlen {
-				bMembers = append(bMembers, make([]btfMember, vlen-len(bMembers))...)
-			}
-
-			n, err := unmarshalBtfMembers(bMembers[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			members, err := convertMembers(bMembers[:vlen], header.Bitfield())
-			if err != nil {
-				return nil, fmt.Errorf("struct %s (id %d): %w", name, id, err)
-			}
-			typ = &Struct{name, header.Size(), members}
-
-		case kindUnion:
-			vlen := header.Vlen()
-			if len(bMembers) < vlen {
-				bMembers = append(bMembers, make([]btfMember, vlen-len(bMembers))...)
-			}
-
-			n, err := unmarshalBtfMembers(bMembers[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			members, err := convertMembers(bMembers[:vlen], header.Bitfield())
-			if err != nil {
-				return nil, fmt.Errorf("struct %s (id %d): %w", name, id, err)
-			}
-			typ = &Union{name, header.Size(), members}
-
-		case kindEnum:
-			vlen := header.Vlen()
-			if len(bEnums) < vlen {
-				bEnums = append(bEnums, make([]btfEnum, vlen-len(bEnums))...)
-			}
-
-			n, err := unmarshalBtfEnums(bEnums[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			vals := make([]EnumValue, 0, vlen)
-			signed := header.Signed()
-			for i, btfVal := range bEnums[:vlen] {
-				name, err := rawStrings.Lookup(btfVal.NameOff)
-				if err != nil {
-					return nil, fmt.Errorf("get name for enum value %d: %s", i, err)
-				}
-				value := uint64(btfVal.Val)
-				if signed {
-					// Sign extend values to 64 bit.
-					value = uint64(int32(btfVal.Val))
-				}
-				vals = append(vals, EnumValue{name, value})
-			}
-			typ = &Enum{name, header.Size(), signed, vals}
-
-		case kindForward:
-			typ = &Fwd{name, header.FwdKind()}
-
-		case kindTypedef:
-			typedef := &Typedef{name, nil}
-			fixup(header.Type(), &typedef.Type)
-			typ = typedef
-
-		case kindVolatile:
-			volatile := &Volatile{nil}
-			fixup(header.Type(), &volatile.Type)
-			typ = volatile
-
-		case kindConst:
-			cnst := &Const{nil}
-			fixup(header.Type(), &cnst.Type)
-			typ = cnst
-
-		case kindRestrict:
-			restrict := &Restrict{nil}
-			fixup(header.Type(), &restrict.Type)
-			typ = restrict
-
-		case kindFunc:
-			fn := &Func{name, nil, header.Linkage()}
-			fixup(header.Type(), &fn.Type)
-			typ = fn
-
-		case kindFuncProto:
-			vlen := header.Vlen()
-			if len(bParams) < vlen {
-				bParams = append(bParams, make([]btfParam, vlen-len(bParams))...)
-			}
-
-			n, err := unmarshalBtfParams(bParams[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			params := make([]FuncParam, 0, vlen)
-			for i, param := range bParams[:vlen] {
-				name, err := rawStrings.Lookup(param.NameOff)
-				if err != nil {
-					return nil, fmt.Errorf("get name for func proto parameter %d: %s", i, err)
-				}
-				params = append(params, FuncParam{
-					Name: name,
-				})
-			}
-			for i := range params {
-				fixup(bParams[i].Type, &params[i].Type)
-			}
-
-			fp := &FuncProto{nil, params}
-			fixup(header.Type(), &fp.Return)
-			typ = fp
-
-		case kindVar:
-			n, err := unmarshalBtfVariable(&bVariable, typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			v := &Var{name, nil, VarLinkage(bVariable.Linkage)}
-			fixup(header.Type(), &v.Type)
-			typ = v
-
-		case kindDatasec:
-			vlen := header.Vlen()
-			if len(bSecInfos) < vlen {
-				bSecInfos = append(bSecInfos, make([]btfVarSecinfo, vlen-len(bSecInfos))...)
-			}
-
-			n, err := unmarshalBtfVarSecInfos(bSecInfos[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			vars := make([]VarSecinfo, 0, vlen)
-			for _, btfVar := range bSecInfos[:vlen] {
-				vars = append(vars, VarSecinfo{
-					Offset: btfVar.Offset,
-					Size:   btfVar.Size,
-				})
-			}
-			for i := range vars {
-				fixup(bSecInfos[i].Type, &vars[i].Type)
-			}
-			typ = &Datasec{name, header.Size(), vars}
-
-		case kindFloat:
-			typ = &Float{name, header.Size()}
-
-		case kindDeclTag:
-			n, err := unmarshalBtfDeclTag(&bDeclTag, typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			btfIndex := bDeclTag.ComponentIdx
-			if uint64(btfIndex) > math.MaxInt {
-				return nil, fmt.Errorf("type id %d: index exceeds int", id)
-			}
-
-			dt := &declTag{nil, name, int(int32(btfIndex))}
-			fixup(header.Type(), &dt.Type)
-			typ = dt
-
-			declTags = append(declTags, dt)
-
-		case kindTypeTag:
-			tt := &typeTag{nil, name}
-			fixup(header.Type(), &tt.Type)
-			typ = tt
-
-		case kindEnum64:
-			vlen := header.Vlen()
-			if len(bEnums64) < vlen {
-				bEnums64 = append(bEnums64, make([]btfEnum64, vlen-len(bEnums64))...)
-			}
-
-			n, err := unmarshalBtfEnums64(bEnums64[:vlen], typesBytes[off:], bo)
-			if err != nil {
-				return nil, fmt.Errorf("type id %d: %w", id, err)
-			}
-			off += n
-
-			vals := make([]EnumValue, 0, vlen)
-			for i, btfVal := range bEnums64 {
-				name, err := rawStrings.Lookup(btfVal.NameOff)
-				if err != nil {
-					return nil, fmt.Errorf("get name for enum64 value %d: %s", i, err)
-				}
-				value := (uint64(btfVal.ValHi32) << 32) | uint64(btfVal.ValLo32)
-				vals = append(vals, EnumValue{name, value})
-			}
-			typ = &Enum{name, header.Size(), header.Signed(), vals}
-
-		default:
-			return nil, fmt.Errorf("type id %d: unknown kind: %v", id, header.Kind())
-		}
-
-		types = append(types, typ)
 	}
+	d.fixups = d.fixups[:0]
 
-	for _, fixup := range fixups {
-		if fixup.id < firstTypeID {
-			return nil, fmt.Errorf("fixup for base type id %d is not expected", fixup.id)
+	// TODO does this work for out of order types?
+	for _, bitfieldFixup := range d.bitfieldFixups {
+		if bitfieldFixup.id < d.firstTypeID {
+			return fmt.Errorf("bitfield fixup from split to base types is not expected")
 		}
 
-		idx := int(fixup.id - firstTypeID)
-		if idx >= len(types) {
-			return nil, fmt.Errorf("reference to invalid type id: %d", fixup.id)
-		}
-
-		*fixup.typ = types[idx]
-	}
-
-	for _, bitfieldFixup := range bitfieldFixups {
-		if bitfieldFixup.id < firstTypeID {
-			return nil, fmt.Errorf("bitfield fixup from split to base types is not expected")
-		}
-
-		data, ok := legacyBitfields[bitfieldFixup.id]
+		data, ok := d.legacyBitfields[bitfieldFixup.id]
 		if ok {
 			// This is indeed a legacy bitfield, fix it up.
 			bitfieldFixup.m.Offset += data[0]
 			bitfieldFixup.m.BitfieldSize = data[1]
 		}
 	}
+	d.bitfieldFixups = d.bitfieldFixups[:0]
 
-	for _, dt := range declTags {
+	for _, dt := range d.uncheckedDeclTags {
 		switch t := dt.Type.(type) {
 		case *Var, *Typedef:
 			if dt.Index != -1 {
-				return nil, fmt.Errorf("type %s: index %d is not -1", dt, dt.Index)
+				return fmt.Errorf("type %s: index %d is not -1", dt, dt.Index)
 			}
 
 		case composite:
 			if dt.Index >= len(t.members()) {
-				return nil, fmt.Errorf("type %s: index %d exceeds members of %s", dt, dt.Index, t)
+				return fmt.Errorf("type %s: index %d exceeds members of %s", dt, dt.Index, t)
 			}
 
 		case *Func:
 			fp, ok := t.Type.(*FuncProto)
 			if !ok {
-				return nil, fmt.Errorf("type %s: %s is not a FuncProto", dt, t.Type)
+				return fmt.Errorf("type %s: %s is not a FuncProto", dt, t.Type)
 			}
 
 			if dt.Index >= len(fp.Params) {
-				return nil, fmt.Errorf("type %s: index %d exceeds params of %s", dt, dt.Index, t)
+				return fmt.Errorf("type %s: index %d exceeds params of %s", dt, dt.Index, t)
 			}
 
 		default:
-			return nil, fmt.Errorf("type %s: decl tag for type %s is not supported", dt, t)
+			return fmt.Errorf("type %s: decl tag for type %s is not supported", dt, t)
+		}
+	}
+	d.uncheckedDeclTags = d.uncheckedDeclTags[:0]
+
+	return nil
+}
+
+func (d *typeDecoder) DecodeAll() error {
+	// Skip decoding void
+	id := d.firstTypeID
+	if id == 0 {
+		id = 1
+	}
+
+	for ; id < d.firstTypeID+TypeID(len(d.types)); id++ {
+		typ, err := d.decode(id)
+		if err != nil {
+			return err
+		}
+
+		d.types[id-d.firstTypeID] = typ
+	}
+
+	return d.applyFixups()
+}
+
+func (d *typeDecoder) decode(id TypeID) (Type, error) {
+	off := d.typeOffsets[id-d.firstTypeID]
+
+	n, err := unmarshalBtfType(&d.header, d.btfBytes[off:], d.bo)
+	if err != nil {
+		return nil, fmt.Errorf("type id %d: %w", id, err)
+	}
+
+	off += n
+
+	var typ Type
+
+	if id < d.firstTypeID {
+		return nil, fmt.Errorf("no more type IDs")
+	}
+
+	name, err := d.stringTable.Lookup(d.header.NameOff)
+	if err != nil {
+		return nil, fmt.Errorf("get name for type id %d: %w", id, err)
+	}
+
+	switch d.header.Kind() {
+	case kindInt:
+		_, err := unmarshalBtfInt(&d.bInt, d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		size := d.header.Size()
+		if d.bInt.Offset() > 0 || d.bInt.Bits().Bytes() != size {
+			d.legacyBitfields[id] = [2]Bits{d.bInt.Offset(), d.bInt.Bits()}
+		}
+		typ = &Int{name, d.header.Size(), d.bInt.Encoding()}
+
+	case kindPointer:
+		ptr := &Pointer{nil}
+		d.fixup(d.header.Type(), &ptr.Target)
+		typ = ptr
+
+	case kindArray:
+		_, err := unmarshalBtfArray(&d.bArr, d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		arr := &Array{nil, nil, d.bArr.Nelems}
+		d.fixup(d.bArr.IndexType, &arr.Index)
+		d.fixup(d.bArr.Type, &arr.Type)
+		typ = arr
+
+	case kindStruct:
+		vlen := d.header.Vlen()
+		if len(d.bMembers) < vlen {
+			d.bMembers = append(d.bMembers, make([]btfMember, vlen-len(d.bMembers))...)
+		}
+
+		_, err := unmarshalBtfMembers(d.bMembers[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		members, err := d.convertMembers(d.bMembers[:vlen], d.header.Bitfield())
+		if err != nil {
+			return nil, fmt.Errorf("struct %s (id %d): %w", name, id, err)
+		}
+		typ = &Struct{name, d.header.Size(), members}
+
+	case kindUnion:
+		vlen := d.header.Vlen()
+		if len(d.bMembers) < vlen {
+			d.bMembers = append(d.bMembers, make([]btfMember, vlen-len(d.bMembers))...)
+		}
+
+		_, err := unmarshalBtfMembers(d.bMembers[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		members, err := d.convertMembers(d.bMembers[:vlen], d.header.Bitfield())
+		if err != nil {
+			return nil, fmt.Errorf("struct %s (id %d): %w", name, id, err)
+		}
+		typ = &Union{name, d.header.Size(), members}
+
+	case kindEnum:
+		vlen := d.header.Vlen()
+		if len(d.bEnums) < vlen {
+			d.bEnums = append(d.bEnums, make([]btfEnum, vlen-len(d.bEnums))...)
+		}
+
+		_, err := unmarshalBtfEnums(d.bEnums[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		vals := make([]EnumValue, 0, vlen)
+		signed := d.header.Signed()
+		for i, btfVal := range d.bEnums[:vlen] {
+			name, err := d.stringTable.Lookup(btfVal.NameOff)
+			if err != nil {
+				return nil, fmt.Errorf("get name for enum value %d: %s", i, err)
+			}
+			value := uint64(btfVal.Val)
+			if signed {
+				// Sign extend values to 64 bit.
+				value = uint64(int32(btfVal.Val))
+			}
+			vals = append(vals, EnumValue{name, value})
+		}
+		typ = &Enum{name, d.header.Size(), signed, vals}
+
+	case kindForward:
+		typ = &Fwd{name, d.header.FwdKind()}
+
+	case kindTypedef:
+		typedef := &Typedef{name, nil}
+		d.fixup(d.header.Type(), &typedef.Type)
+		typ = typedef
+
+	case kindVolatile:
+		volatile := &Volatile{nil}
+		d.fixup(d.header.Type(), &volatile.Type)
+		typ = volatile
+
+	case kindConst:
+		cnst := &Const{nil}
+		d.fixup(d.header.Type(), &cnst.Type)
+		typ = cnst
+
+	case kindRestrict:
+		restrict := &Restrict{nil}
+		d.fixup(d.header.Type(), &restrict.Type)
+		typ = restrict
+
+	case kindFunc:
+		fn := &Func{name, nil, d.header.Linkage()}
+		d.fixup(d.header.Type(), &fn.Type)
+		typ = fn
+
+	case kindFuncProto:
+		vlen := d.header.Vlen()
+		if len(d.bParams) < vlen {
+			d.bParams = append(d.bParams, make([]btfParam, vlen-len(d.bParams))...)
+		}
+
+		_, err := unmarshalBtfParams(d.bParams[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		params := make([]FuncParam, 0, vlen)
+		for i, param := range d.bParams[:vlen] {
+			name, err := d.stringTable.Lookup(param.NameOff)
+			if err != nil {
+				return nil, fmt.Errorf("get name for func proto parameter %d: %s", i, err)
+			}
+			params = append(params, FuncParam{
+				Name: name,
+			})
+		}
+		for i := range params {
+			d.fixup(d.bParams[i].Type, &params[i].Type)
+		}
+
+		fp := &FuncProto{nil, params}
+		d.fixup(d.header.Type(), &fp.Return)
+		typ = fp
+
+	case kindVar:
+		_, err := unmarshalBtfVariable(&d.bVariable, d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		v := &Var{name, nil, VarLinkage(d.bVariable.Linkage)}
+		d.fixup(d.header.Type(), &v.Type)
+		typ = v
+
+	case kindDatasec:
+		vlen := d.header.Vlen()
+		if len(d.bSecInfos) < vlen {
+			d.bSecInfos = append(d.bSecInfos, make([]btfVarSecinfo, vlen-len(d.bSecInfos))...)
+		}
+
+		_, err := unmarshalBtfVarSecInfos(d.bSecInfos[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		vars := make([]VarSecinfo, 0, vlen)
+		for _, btfVar := range d.bSecInfos[:vlen] {
+			vars = append(vars, VarSecinfo{
+				Offset: btfVar.Offset,
+				Size:   btfVar.Size,
+			})
+		}
+		for i := range vars {
+			d.fixup(d.bSecInfos[i].Type, &vars[i].Type)
+		}
+		typ = &Datasec{name, d.header.Size(), vars}
+
+	case kindFloat:
+		typ = &Float{name, d.header.Size()}
+
+	case kindDeclTag:
+		_, err := unmarshalBtfDeclTag(&d.bDeclTag, d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		btfIndex := d.bDeclTag.ComponentIdx
+		if uint64(btfIndex) > math.MaxInt {
+			return nil, fmt.Errorf("type id %d: index exceeds int", id)
+		}
+
+		dt := &declTag{nil, name, int(int32(btfIndex))}
+		d.fixup(d.header.Type(), &dt.Type)
+		typ = dt
+
+		d.uncheckedDeclTags = append(d.uncheckedDeclTags, dt)
+
+	case kindTypeTag:
+		tt := &typeTag{nil, name}
+		d.fixup(d.header.Type(), &tt.Type)
+		typ = tt
+
+	case kindEnum64:
+		vlen := d.header.Vlen()
+		if len(d.bEnums64) < vlen {
+			d.bEnums64 = append(d.bEnums64, make([]btfEnum64, vlen-len(d.bEnums64))...)
+		}
+
+		_, err := unmarshalBtfEnums64(d.bEnums64[:vlen], d.btfBytes[off:], d.bo)
+		if err != nil {
+			return nil, fmt.Errorf("type id %d: %w", id, err)
+		}
+
+		vals := make([]EnumValue, 0, vlen)
+		for i, btfVal := range d.bEnums64 {
+			name, err := d.stringTable.Lookup(btfVal.NameOff)
+			if err != nil {
+				return nil, fmt.Errorf("get name for enum64 value %d: %s", i, err)
+			}
+			value := (uint64(btfVal.ValHi32) << 32) | uint64(btfVal.ValLo32)
+			vals = append(vals, EnumValue{name, value})
+		}
+		typ = &Enum{name, d.header.Size(), d.header.Signed(), vals}
+
+	default:
+		return nil, fmt.Errorf("type id %d: unknown kind: %v", id, d.header.Kind())
+	}
+
+	return typ, nil
+}
+
+func (d *typeDecoder) fixup(id TypeID, typ *Type) {
+	if id < d.firstTypeID {
+		if baseType, err := d.base.TypeByID(id); err == nil {
+			*typ = baseType
+			return
 		}
 	}
 
-	return types, nil
+	idx := int(id - d.firstTypeID)
+	if d.types[idx] != nil {
+		// We've already inflated this type, fix it up immediately.
+		*typ = d.types[idx]
+		return
+	}
+
+	d.fixups = append(d.fixups, fixupDef{id, typ})
+}
+
+func (d *typeDecoder) convertMembers(raw []btfMember, kindFlag bool) ([]Member, error) {
+	// NB: The fixup below relies on pre-allocating this array to
+	// work, since otherwise append might re-allocate members.
+	members := make([]Member, 0, len(raw))
+	for i, btfMember := range raw {
+		name, err := d.stringTable.Lookup(btfMember.NameOff)
+		if err != nil {
+			return nil, fmt.Errorf("can't get name for member %d: %w", i, err)
+		}
+
+		members = append(members, Member{
+			Name:   name,
+			Offset: Bits(btfMember.Offset),
+		})
+
+		m := &members[i]
+		d.fixup(raw[i].Type, &m.Type)
+
+		if kindFlag {
+			m.BitfieldSize = Bits(btfMember.Offset >> 24)
+			m.Offset &= 0xffffff
+			// We ignore legacy bitfield definitions if the current composite
+			// is a new-style bitfield. This is kind of safe since offset and
+			// size on the type of the member must be zero if kindFlat is set
+			// according to spec.
+			continue
+		}
+
+		// This may be a legacy bitfield, try to fix it up.
+		data, ok := d.legacyBitfields[raw[i].Type]
+		if ok {
+			// Bingo!
+			m.Offset += data[0]
+			m.BitfieldSize = data[1]
+			continue
+		}
+
+		if m.Type != nil {
+			// We couldn't find a legacy bitfield, but we know that the member's
+			// type has already been inflated. Hence we know that it can't be
+			// a legacy bitfield and there is nothing left to do.
+			continue
+		}
+
+		// We don't have fixup data, and the type we're pointing
+		// at hasn't been inflated yet. No choice but to defer
+		// the fixup.
+		d.bitfieldFixups = append(d.bitfieldFixups, bitfieldFixupDef{
+			raw[i].Type,
+			m,
+		})
+	}
+	return members, nil
+}
+
+type fixupDef struct {
+	id  TypeID
+	typ *Type
+}
+
+type bitfieldFixupDef struct {
+	id TypeID
+	m  *Member
+}
+
+// readAndParseType takes a slice of bytes containing BTF types and parses them.
+//
+// If base is provided, then the types are considered to be of a split BTF
+// (e.g., a kernel module).
+//
+// Returns a slice of types indexed by TypeID. Since BTF ignores compilation
+// units, multiple types may share the same name. A Type may form a cyclic graph
+// by pointing at itself.
+func readAndParseType(typesBytes []byte, bo binary.ByteOrder, typeLen uint32, rawStrings *stringTable, base *Spec) ([]Type, error) {
+	decoder, err := newDecoder(typesBytes, bo, typeLen, rawStrings, base)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := decoder.DecodeAll(); err != nil {
+		return nil, err
+	}
+
+	return decoder.types, nil
 }
 
 // essentialName represents the name of a BTF type stripped of any flavor
