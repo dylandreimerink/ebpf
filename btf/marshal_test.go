@@ -37,6 +37,7 @@ func TestBuilderMarshal(t *testing.T) {
 
 	have, err := loadRawSpec(bytes.NewReader(buf), internal.NativeEndian, nil)
 	qt.Assert(t, err, qt.IsNil, qt.Commentf("Couldn't parse BTF"))
+	typesFromSpec(t, have)
 	qt.Assert(t, have.types, qt.DeepEquals, want)
 }
 

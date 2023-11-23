@@ -2,6 +2,7 @@ package btf
 
 import (
 	"bufio"
+	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
@@ -32,6 +33,8 @@ type ID = sys.BTFID
 // Spec allows querying a set of Types and loading the set into the
 // kernel.
 type Spec struct {
+	base *Spec
+
 	// All types contained by the spec, not including types from the base in
 	// case the spec was parsed from split BTF.
 	types []Type
@@ -44,13 +47,17 @@ type Spec struct {
 
 	// Types indexed by essential name.
 	// Includes all struct flavors and types with the same name.
-	namedTypes map[essentialName][]Type
+	namedTypes map[essentialName][]TypeID
 
 	// String table from ELF.
 	strings *stringTable
 
 	// Byte order of the ELF we decoded the spec from, may be nil.
 	byteOrder binary.ByteOrder
+
+	typesReader io.ReaderAt
+
+	typeOffsets []int64
 }
 
 // LoadSpec opens file and calls LoadSpecFromReader on it.
@@ -209,27 +216,59 @@ func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, base *Spec) (*Spec, error
 		}
 	}
 
-	types, rawStrings, err := parseBTF(btf, bo, baseStrings, base)
+	buf := internal.NewBufferedSectionReader(btf, 0, math.MaxInt64)
+	header, err := parseBTFHeader(buf, bo)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing .BTF header: %v", err)
 	}
 
-	typeIDs, typesByName := indexTypes(types, firstTypeID)
+	rawStrings, err := readStringTable(io.NewSectionReader(btf, header.stringStart(), int64(header.StringLen)),
+		baseStrings)
+	if err != nil {
+		return nil, fmt.Errorf("can't read type names: %w", err)
+	}
+
+	typesBytes := make([]byte, header.TypeLen)
+	_, err = io.ReadFull(io.NewSectionReader(btf, header.typeStart(), int64(header.TypeLen)), typesBytes)
+	if err != nil {
+		return nil, fmt.Errorf("can't read types: %w", err)
+	}
+
+	typesReader := bytes.NewReader(typesBytes)
+	typeOffsets, typeNames, err := indexRawBTF(typesReader, bo, header.TypeLen)
+	if err != nil {
+		return nil, fmt.Errorf("indexing raw BTF: %v", err)
+	}
+	types := make([]Type, len(typeOffsets))
+
+	// Void is defined to always be type ID 0, and is thus omitted from BTF.
+	types[0] = (*Void)(nil)
+	if base != nil {
+		// Split BTF doesn't contain Void.
+		types = types[1:]
+		typeOffsets = typeOffsets[1:]
+		typeNames = typeNames[1:]
+	}
+
+	typesByName := indexTypeNames(typeNames, firstTypeID, rawStrings)
 
 	return &Spec{
+		base:        base,
 		namedTypes:  typesByName,
-		typeIDs:     typeIDs,
+		typeIDs:     make(map[Type]TypeID, len(types)),
 		types:       types,
 		firstTypeID: firstTypeID,
 		strings:     rawStrings,
 		byteOrder:   bo,
+		typesReader: typesReader,
+		typeOffsets: typeOffsets,
 	}, nil
 }
 
-func indexTypes(types []Type, firstTypeID TypeID) (map[Type]TypeID, map[essentialName][]Type) {
+func indexTypeNames(typeNameOffsets []uint32, firstTypeID TypeID, stringTable *stringTable) map[essentialName][]TypeID {
 	namedTypes := 0
-	for _, typ := range types {
-		if typ.TypeName() != "" {
+	for _, off := range typeNameOffsets {
+		if off == 0 {
 			// Do a pre-pass to figure out how big types by name has to be.
 			// Most types have unique names, so it's OK to ignore essentialName
 			// here.
@@ -237,17 +276,22 @@ func indexTypes(types []Type, firstTypeID TypeID) (map[Type]TypeID, map[essentia
 		}
 	}
 
-	typeIDs := make(map[Type]TypeID, len(types))
-	typesByName := make(map[essentialName][]Type, namedTypes)
+	typesByName := make(map[essentialName][]TypeID, namedTypes)
 
-	for i, typ := range types {
-		if name := newEssentialName(typ.TypeName()); name != "" {
-			typesByName[name] = append(typesByName[name], typ)
+	for i, off := range typeNameOffsets {
+		name, err := stringTable.Lookup(off)
+		if err != nil {
+			// TODO panic? return error
+			continue
 		}
-		typeIDs[typ] = firstTypeID + TypeID(i)
+
+		id := firstTypeID + TypeID(i)
+		if name := newEssentialName(name); name != "" {
+			typesByName[name] = append(typesByName[name], id)
+		}
 	}
 
-	return typeIDs, typesByName
+	return typesByName
 }
 
 // LoadKernelSpec returns the current kernel's BTF information.
@@ -306,6 +350,16 @@ func loadKernelSpec() (_ *Spec, fallback bool, _ error) {
 	fh, err := os.Open("/sys/kernel/btf/vmlinux")
 	if err == nil {
 		defer fh.Close()
+		stat, err := fh.Stat()
+		if err != nil {
+			return nil, false, err
+		}
+
+		btf := make([]byte, stat.Size())
+		_, err = io.ReadFull(fh, btf)
+		if err != nil {
+			return nil, false, err
+		}
 
 		spec, err := loadRawSpec(fh, internal.NativeEndian, nil)
 		return spec, false, err
@@ -364,30 +418,6 @@ func guessRawBTFByteOrder(r io.ReaderAt) binary.ByteOrder {
 	}
 
 	return nil
-}
-
-// parseBTF reads a .BTF section into memory and parses it into a list of
-// raw types and a string table.
-func parseBTF(btf io.ReaderAt, bo binary.ByteOrder, baseStrings *stringTable, base *Spec) ([]Type, *stringTable, error) {
-	buf := internal.NewBufferedSectionReader(btf, 0, math.MaxInt64)
-	header, err := parseBTFHeader(buf, bo)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parsing .BTF header: %v", err)
-	}
-
-	rawStrings, err := readStringTable(io.NewSectionReader(btf, header.stringStart(), int64(header.StringLen)),
-		baseStrings)
-	if err != nil {
-		return nil, nil, fmt.Errorf("can't read type names: %w", err)
-	}
-
-	buf.Reset(io.NewSectionReader(btf, header.typeStart(), int64(header.TypeLen)))
-	types, err := readAndInflateTypes(buf, bo, header.TypeLen, rawStrings, base)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return types, rawStrings, nil
 }
 
 type symbol struct {
@@ -492,17 +522,27 @@ func fixupDatasecLayout(ds *Datasec) error {
 
 // Copy creates a copy of Spec.
 func (s *Spec) Copy() *Spec {
-	types := copyTypes(s.types, nil)
-	typeIDs, typesByName := indexTypes(types, s.firstTypeID)
+	var base *Spec
+	if s.base != nil {
+		base = s.base.Copy()
+	}
+
+	types := make([]Type, len(s.types))
+	if s.base == nil {
+		types[0] = (*Void)(nil)
+	}
 
 	// NB: Other parts of spec are not copied since they are immutable.
 	return &Spec{
+		base,
 		types,
-		typeIDs,
+		make(map[Type]sys.TypeID),
 		s.firstTypeID,
-		typesByName,
+		s.namedTypes,
 		s.strings,
 		s.byteOrder,
+		s.typesReader,
+		s.typeOffsets,
 	}
 }
 
@@ -540,7 +580,11 @@ func (s *Spec) TypeByID(id TypeID) (Type, error) {
 		return nil, fmt.Errorf("look up type with ID %d: %w", id, ErrNotFound)
 	}
 
-	return s.types[index], nil
+	if s.types[index] != nil {
+		return s.types[index], nil
+	}
+
+	return s.inflateType(id)
 }
 
 // TypeID returns the ID for a given Type.
@@ -568,20 +612,27 @@ func (s *Spec) TypeID(typ Type) (TypeID, error) {
 //
 // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
 func (s *Spec) AnyTypesByName(name string) ([]Type, error) {
-	types := s.namedTypes[newEssentialName(name)]
-	if len(types) == 0 {
-		return nil, fmt.Errorf("type name %s: %w", name, ErrNotFound)
-	}
+	typeIDs := s.namedTypes[newEssentialName(name)]
 
 	// Return a copy to prevent changes to namedTypes.
-	result := make([]Type, 0, len(types))
-	for _, t := range types {
+	result := make([]Type, 0, len(typeIDs))
+	for _, tid := range typeIDs {
+		t, err := s.TypeByID(tid)
+		if err != nil {
+			return nil, err
+		}
+
 		// Match against the full name, not just the essential one
 		// in case the type being looked up is a struct flavor.
 		if t.TypeName() == name {
 			result = append(result, t)
 		}
 	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("type name %s: %w", name, ErrNotFound)
+	}
+
 	return result, nil
 }
 
@@ -671,8 +722,8 @@ func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
 
 // TypesIterator iterates over types of a given spec.
 type TypesIterator struct {
-	types []Type
-	index int
+	spec *Spec
+	id   sys.TypeID
 	// The last visited type in the spec.
 	Type Type
 }
@@ -681,16 +732,17 @@ type TypesIterator struct {
 func (s *Spec) Iterate() *TypesIterator {
 	// We share the backing array of types with the Spec. This is safe since
 	// we don't allow deletion or shuffling of types.
-	return &TypesIterator{types: s.types, index: 0}
+	return &TypesIterator{spec: s, id: s.firstTypeID}
 }
 
 // Next returns true as long as there are any remaining types.
 func (iter *TypesIterator) Next() bool {
-	if len(iter.types) <= iter.index {
+	var err error
+	iter.Type, err = iter.spec.TypeByID(iter.id)
+	if err != nil {
 		return false
 	}
 
-	iter.Type = iter.types[iter.index]
-	iter.index++
+	iter.id++
 	return true
 }

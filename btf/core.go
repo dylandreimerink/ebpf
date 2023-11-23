@@ -227,7 +227,15 @@ func CORERelocate(relos []*CORERelocation, target *Spec, bo binary.ByteOrder, re
 			return nil, fmt.Errorf("relocate unnamed or anonymous type %s: %w", localType, ErrNotSupported)
 		}
 
-		targets := target.namedTypes[newEssentialName(localTypeName)]
+		targetIds := target.namedTypes[newEssentialName(localTypeName)]
+		targets := make([]Type, 0, len(targetIds))
+		for _, id := range targetIds {
+			targetType, err := target.TypeByID(id)
+			if err != nil {
+				return nil, fmt.Errorf("target type %d: %w", id, err)
+			}
+			targets = append(targets, targetType)
+		}
 		fixups, err := coreCalculateFixups(group.relos, target, targets, bo)
 		if err != nil {
 			return nil, fmt.Errorf("relocate %s: %w", localType, err)
