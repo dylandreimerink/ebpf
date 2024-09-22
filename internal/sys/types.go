@@ -720,7 +720,7 @@ type ProgInfo struct {
 	Tag                  [8]uint8
 	JitedProgLen         uint32
 	XlatedProgLen        uint32
-	JitedProgInsns       uint64
+	JitedProgInsns       Pointer
 	XlatedProgInsns      Pointer
 	LoadTime             uint64
 	CreatedByUid         uint32

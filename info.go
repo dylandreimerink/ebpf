@@ -137,7 +137,7 @@ type ProgramInfo struct {
 
 	maps                 []MapID
 	insns                []byte
-	jitedSize            uint32
+	jited                []byte
 	verifiedInstructions uint32
 
 	lineInfos    []byte
@@ -167,7 +167,6 @@ func newProgramInfoFromFd(fd *sys.FD) (*ProgramInfo, error) {
 			runCount:        info.RunCnt,
 			recursionMisses: info.RecursionMisses,
 		},
-		jitedSize:            info.JitedProgLen,
 		loadTime:             time.Duration(info.LoadTime),
 		verifiedInstructions: info.VerifiedInsns,
 	}
@@ -200,6 +199,13 @@ func newProgramInfoFromFd(fd *sys.FD) (*ProgramInfo, error) {
 		pi.insns = make([]byte, info.XlatedProgLen)
 		info2.XlatedProgLen = info.XlatedProgLen
 		info2.XlatedProgInsns = sys.NewSlicePointer(pi.insns)
+		makeSecondCall = true
+	}
+
+	if info.JitedProgLen > 0 {
+		pi.jited = make([]byte, info.JitedProgLen)
+		info2.JitedProgLen = info.JitedProgLen
+		info2.JitedProgInsns = sys.NewSlicePointer(pi.jited)
 		makeSecondCall = true
 	}
 
@@ -397,15 +403,22 @@ func (pi *ProgramInfo) Instructions() (asm.Instructions, error) {
 	return insns, nil
 }
 
+func (pi *ProgramInfo) JittedInstructions() ([]byte, error) {
+	if len(pi.jited) == 0 {
+		return nil, fmt.Errorf("insufficient permissions, unsupported kernel, or JIT compiler disabled: %w", ErrNotSupported)
+	}
+	return pi.jited, nil
+}
+
 // JitedSize returns the size of the program's JIT-compiled machine code in bytes, which is the
 // actual code executed on the host's CPU. This field requires the BPF JIT compiler to be enabled.
 //
 // Available from 4.13. Reading this metadata requires CAP_BPF or equivalent.
 func (pi *ProgramInfo) JitedSize() (uint32, error) {
-	if pi.jitedSize == 0 {
+	if len(pi.jited) == 0 {
 		return 0, fmt.Errorf("insufficient permissions, unsupported kernel, or JIT compiler disabled: %w", ErrNotSupported)
 	}
-	return pi.jitedSize, nil
+	return uint32(len(pi.jited)), nil
 }
 
 // TranslatedSize returns the size of the program's translated instructions in bytes, after it has

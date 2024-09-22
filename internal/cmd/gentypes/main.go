@@ -197,6 +197,7 @@ import (
 			"ProgInfo", "bpf_prog_info",
 			[]patch{
 				replace(objName, "name"),
+				replace(pointer, "jited_prog_insns"),
 				replace(pointer, "xlated_prog_insns"),
 				replace(pointer, "map_ids"),
 				replace(pointer, "line_info"),
